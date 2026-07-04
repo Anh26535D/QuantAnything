@@ -160,3 +160,87 @@ class QuantContainer:
             return tensor_values[id(self.model.outputs[0])]
         else:
             return [tensor_values[id(out)] for out in self.model.outputs]
+
+    def compare_layers(self, x):
+        """
+        Runs both float and quantized execution passes and returns a dictionary 
+        containing comparison metrics (Max Diff, Mean Diff) for each layer.
+        """
+        tensor_values_float = {}
+        tensor_values_quant = {}
+        
+        # Feed inputs
+        if not isinstance(x, dict):
+            input_tensor = self.model.inputs[0]
+            tensor_values_float[id(input_tensor)] = x
+            tensor_values_quant[id(input_tensor)] = x
+        else:
+            for k, v in x.items():
+                for inp in self.model.inputs:
+                    if inp.name == k:
+                        tensor_values_float[id(inp)] = v
+                        tensor_values_quant[id(inp)] = v
+                        break
+                        
+        comparison = {}
+        
+        for layer in self.model.layers:
+            if isinstance(layer, keras.layers.InputLayer):
+                layer_output = layer.output
+                if id(layer_output) not in tensor_values_float:
+                    if not isinstance(x, dict):
+                        tensor_values_float[id(layer_output)] = x
+                        tensor_values_quant[id(layer_output)] = x
+                continue
+                
+            q_layer = self.quant_layers[layer.name]
+            
+            # --- Float pass ---
+            inputs_f = layer.input
+            if isinstance(inputs_f, list):
+                inp_vals_f = [tensor_values_float[id(t)] for t in inputs_f]
+            else:
+                inp_vals_f = tensor_values_float[id(inputs_f)]
+                
+            inputs_tf = [tf.convert_to_tensor(v, dtype=tf.float32) for v in inp_vals_f] if isinstance(inp_vals_f, list) else tf.convert_to_tensor(inp_vals_f, dtype=tf.float32)
+            outputs_tf = layer(inputs_tf)
+            out_val_f = outputs_tf.numpy()
+            
+            outputs_f = layer.output
+            if isinstance(outputs_f, list):
+                for j, out_t in enumerate(outputs_f):
+                    tensor_values_float[id(out_t)] = out_val_f[j]
+            else:
+                tensor_values_float[id(outputs_f)] = out_val_f
+                
+            # --- Quantized pass ---
+            inputs_q = layer.input
+            if isinstance(inputs_q, list):
+                inp_vals_q = [tensor_values_quant[id(t)] for t in inputs_q]
+            else:
+                inp_vals_q = tensor_values_quant[id(inputs_q)]
+                
+            out_val_q = q_layer.quantized_infer(inp_vals_q)
+            
+            outputs_q = layer.output
+            if isinstance(outputs_q, list):
+                for j, out_t in enumerate(outputs_q):
+                    tensor_values_quant[id(out_t)] = out_val_q[j]
+            else:
+                tensor_values_quant[id(outputs_q)] = out_val_q
+                
+            # --- Compute metrics ---
+            if isinstance(out_val_f, list):
+                max_diff = np.max([np.max(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q)])
+                mean_diff = np.mean([np.mean(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q)])
+            else:
+                max_diff = np.max(np.abs(out_val_f - out_val_q))
+                mean_diff = np.mean(np.abs(out_val_f - out_val_q))
+                
+            comparison[layer.name] = {
+                "max_diff": max_diff,
+                "mean_diff": mean_diff,
+                "layer_type": type(layer).__name__
+            }
+            
+        return comparison
