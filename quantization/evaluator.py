@@ -149,17 +149,20 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
     
     onnx_keras_errors = []
     keras_quant_errors = []
+    kl_divergences = []
+    
+    y_true_list = []
+    preds_onnx_list = []
+    preds_keras_list = []
+    preds_quant_list = []
     
     total_samples = 0
-    onnx_top1_corr = 0
-    keras_top1_corr = 0
-    quant_top1_corr = 0
-    
     has_labels = False
     
     for batch_idx, (x_batch, y_batch) in enumerate(dataset_loader):
         if y_batch is not None:
             has_labels = True
+            y_true_list.extend(y_batch)
             
         # ONNX Inference
         ort_inputs = {ort_session.get_inputs()[0].name: x_batch}
@@ -179,6 +182,13 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
         onnx_keras_errors.append(diff_onnx_keras)
         keras_quant_errors.append(diff_keras_quant)
         
+        # Compute KL-Divergence KL(Keras || Quantized)
+        eps = 1e-15
+        p = np.clip(out_keras, eps, 1.0)
+        q = np.clip(out_quant, eps, 1.0)
+        kl = np.sum(p * np.log(p / q), axis=-1)
+        kl_divergences.extend(kl)
+        
         # Check classification accuracy
         batch_size = x_batch.shape[0]
         total_samples += batch_size
@@ -188,22 +198,43 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
         preds_keras = np.argmax(out_keras, axis=1)
         preds_quant = np.argmax(out_quant, axis=1)
         
-        if has_labels:
-            onnx_top1_corr += np.sum(preds_onnx == y_batch)
-            keras_top1_corr += np.sum(preds_keras == y_batch)
-            quant_top1_corr += np.sum(preds_quant == y_batch)
+        preds_onnx_list.extend(preds_onnx)
+        preds_keras_list.extend(preds_keras)
+        preds_quant_list.extend(preds_quant)
             
-        print(f"Batch {batch_idx + 1}: Max ONNX vs Keras diff = {diff_onnx_keras:.6f} | Max Keras vs Quantized diff = {diff_keras_quant:.6f}")
+        print(f"Batch {batch_idx + 1}: Max ONNX vs Keras diff = {diff_onnx_keras:.6f} | Max Keras vs Quantized diff = {diff_keras_quant:.6f} | KL-Div = {np.mean(kl):.6f}")
         
     print("\n================== Evaluation Results ==================")
     print(f"Total samples evaluated: {total_samples}")
     print(f"Average ONNX vs Keras Conversion Error (Max Abs Diff): {np.mean(onnx_keras_errors):.6f}")
     print(f"Average Keras vs Quantized Quantization Error (Max Abs Diff): {np.mean(keras_quant_errors):.6f}")
+    print(f"Average KL-Divergence KL(Keras || Quantized): {np.mean(kl_divergences):.6f}")
     
     if has_labels:
-        print(f"ONNX Model Accuracy: {onnx_top1_corr / total_samples * 100:.2f}%")
-        print(f"Keras Converted Model Accuracy: {keras_top1_corr / total_samples * 100:.2f}%")
-        print(f"Quantized Model Accuracy: {quant_top1_corr / total_samples * 100:.2f}%")
+        from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+        
+        # Compute metrics for ONNX
+        acc_onnx = accuracy_score(y_true_list, preds_onnx_list)
+        p_onnx, r_onnx, f_onnx, _ = precision_recall_fscore_support(y_true_list, preds_onnx_list, average='macro', zero_division=0)
+        
+        # Compute metrics for Keras
+        acc_keras = accuracy_score(y_true_list, preds_keras_list)
+        p_keras, r_keras, f_keras, _ = precision_recall_fscore_support(y_true_list, preds_keras_list, average='macro', zero_division=0)
+        
+        # Compute metrics for Quantized
+        acc_quant = accuracy_score(y_true_list, preds_quant_list)
+        p_quant, r_quant, f_quant, _ = precision_recall_fscore_support(y_true_list, preds_quant_list, average='macro', zero_division=0)
+        
+        kl_onnx = 0.0
+        kl_keras = 0.0
+        kl_quant = np.mean(kl_divergences)
+        
+        print("\nClassification Metrics Comparison (Macro-averaged):")
+        print(f"{'Model':<15} | {'Accuracy':<10} | {'Precision':<10} | {'Recall':<10} | {'F1-Score':<10} | {'KL-Div':<10}")
+        print("-" * 78)
+        print(f"{'ONNX':<15} | {acc_onnx*100:<9.2f}% | {p_onnx*100:<9.2f}% | {r_onnx*100:<9.2f}% | {f_onnx*100:<9.2f}% | {kl_onnx:<10.6f}")
+        print(f"{'Keras':<15} | {acc_keras*100:<9.2f}% | {p_keras*100:<9.2f}% | {r_keras*100:<9.2f}% | {f_keras*100:<9.2f}% | {kl_keras:<10.6f}")
+        print(f"{'Quantized (INT8)':<15} | {acc_quant*100:<9.2f}% | {p_quant*100:<9.2f}% | {r_quant*100:<9.2f}% | {f_quant*100:<9.2f}% | {kl_quant:<10.6f}")
     else:
         print("Note: Accuracy was not calculated because labels were not available (dummy input mode).")
     print("========================================================")
