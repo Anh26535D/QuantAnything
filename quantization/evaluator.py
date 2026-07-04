@@ -131,21 +131,12 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
     )
     print("Conversion successful.")
     
-    # 5. Initialize ONNX runtime session
-    print("\n--- Step 5: Initializing ONNX Runtime Session ---")
-    ort_session = ort.InferenceSession(onnx_path)
-    
-    # 6. Initialize QuantContainer and run calibration
-    print("\n--- Step 6: Initializing QuantContainer and Calibrating ---")
-    quant_graph = QuantContainer(keras_model, quant_type=quant_type)
-    
-    # Use 3 batches of dummy calibration data
-    calib_data = [np.random.uniform(0.0, 1.0, (8, 3, 224, 224)).astype(np.float32) for _ in range(3)]
-    quant_graph.calibrate(calib_data)
-    
-    # 7. Evaluate on Dataset (Dummy or Real)
-    print("\n--- Step 7: Evaluating Models ---")
-    dataset_loader = load_dataset(dataset_dir, batch_size=1)
+def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_size=1):
+    """
+    Evaluates ONNX, Keras float, and Quantized models on the dataset,
+    printing comparison logs and returning comparison metrics.
+    """
+    dataset_loader = load_dataset(dataset_dir, batch_size=batch_size)
     
     onnx_keras_errors = []
     keras_quant_errors = []
@@ -190,8 +181,8 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
         kl_divergences.extend(kl)
         
         # Check classification accuracy
-        batch_size = x_batch.shape[0]
-        total_samples += batch_size
+        batch_size_actual = x_batch.shape[0]
+        total_samples += batch_size_actual
         
         # Argmax predictions
         preds_onnx = np.argmax(out_onnx, axis=1)
@@ -236,8 +227,54 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
         print(f"{'Keras':<15} | {acc_keras*100:<9.2f}% | {p_keras*100:<9.2f}% | {r_keras*100:<9.2f}% | {f_keras*100:<9.2f}% | {kl_keras:<10.6f}")
         print(f"{'Quantized (INT8)':<15} | {acc_quant*100:<9.2f}% | {p_quant*100:<9.2f}% | {r_quant*100:<9.2f}% | {f_quant*100:<9.2f}% | {kl_quant:<10.6f}")
     else:
-        print("Note: Accuracy was not calculated because labels were not available (dummy input mode).")
+        print("Note: Classification metrics (Accuracy, Precision, Recall, F1) were not calculated because labels were not available (dummy input mode).")
     print("========================================================")
+
+def run_evaluation(dataset_dir="dataset", quant_type="int8"):
+    print("\n==================================================")
+    print(f"Starting YOLOv8-cls Quantization Assessment ({quant_type})")
+    print("==================================================")
+    
+    # 1. Download YOLOv8-cls nano
+    print("\n--- Step 1: Loading model from Ultralytics ---")
+    model = YOLO("yolov8n-cls.pt")
+    
+    # 2. Export to ONNX
+    print("\n--- Step 2: Exporting model to ONNX ---")
+    onnx_path = model.export(format="onnx", imgsz=224)
+    print(f"ONNX model saved at: {onnx_path}")
+    
+    # 3. Load and sanitize ONNX model
+    print("\n--- Step 3: Sanitizing ONNX for Keras 3 ---")
+    onnx_model = onnx.load(onnx_path)
+    sanitized_onnx_model = sanitize_onnx_model(onnx_model)
+    
+    # 4. Convert ONNX to Keras
+    print("\n--- Step 4: Converting ONNX to Keras ---")
+    keras_model = onnx_to_keras(
+        sanitized_onnx_model,
+        input_names=['images'],
+        input_shapes=[[3, 224, 224]],
+        verbose=False,
+        change_ordering=False
+    )
+    print("Conversion successful.")
+    
+    # 5. Initialize ONNX runtime session
+    print("\n--- Step 5: Initializing ONNX Runtime Session ---")
+    ort_session = ort.InferenceSession(onnx_path)
+    
+    # 6. Initialize QuantContainer and run calibration
+    print("\n--- Step 6: Initializing QuantContainer and Calibrating ---")
+    quant_graph = QuantContainer(keras_model, quant_type=quant_type)
+    
+    # Use 3 batches of dummy calibration data
+    calib_data = [np.random.uniform(0.0, 1.0, (8, 3, 224, 224)).astype(np.float32) for _ in range(3)]
+    quant_graph.calibrate(calib_data)
+    
+    # 7. Evaluate
+    print("\n--- Step 7: Evaluating Models ---")
+    evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_size=1)
 
 if __name__ == "__main__":
     # Allow passing custom dataset folder and quantization type
