@@ -76,3 +76,43 @@ def fake_quantize(x, scale, zp, qmin, qmax):
     """
     q = quantize(x, scale, zp, qmin, qmax)
     return dequantize(q, scale, zp)
+
+def quantize_multiplier(real_multiplier):
+    """
+    Converts a float multiplier into a 32-bit integer multiplier (M0) and a shift.
+    real_multiplier = M0 * 2^(-shift)
+    where M0 is in the range [1 << 30, (1 << 31) - 1].
+    """
+    if real_multiplier <= 0:
+        return 0, 0
+    
+    # Normalize multiplier to [0.5, 1.0)
+    significand, exponent = np.frexp(real_multiplier)
+    
+    # Convert significand to 32-bit integer
+    q_multiplier = int(np.round(significand * (1 << 31)))
+    
+    # If q_multiplier reaches 2^31, divide by 2 and decrease shift
+    if q_multiplier >= (1 << 31):
+        q_multiplier = q_multiplier // 2
+        exponent += 1
+        
+    shift = -exponent
+    return q_multiplier, shift
+
+def multiply_by_quantized_multiplier(accum, q_multiplier, shift):
+    """
+    Multiplies a 32-bit integer accumulator by a quantized multiplier (q_multiplier)
+    and right shifts by the shift parameter.
+    """
+    # Keep in 64-bit precision to avoid overflow during multiplication
+    accum = accum.astype(np.int64)
+    product = accum * q_multiplier
+    
+    total_shift = 31 + shift
+    if total_shift > 0:
+        rounding = 1 << (total_shift - 1)
+        result = (product + rounding) >> total_shift
+    else:
+        result = product << (-total_shift)
+    return result.astype(np.int64)

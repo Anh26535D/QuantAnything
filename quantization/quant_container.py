@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
+from quantization.utils import dequantize
 from quantization.quant_layers import (
     BaseQuantLayer,
     InputQuantize,
@@ -12,7 +13,8 @@ from quantization.quant_layers import (
     ConcatenateQuantize,
     GlobalAveragePooling2DQuantize,
     ShapingQuantize,
-    DepthwiseConv2DQuantize
+    DepthwiseConv2DQuantize,
+    MultiplyQuantize
 )
 
 def map_layer_to_quant(layer, quant_type="int8"):
@@ -35,6 +37,8 @@ def map_layer_to_quant(layer, quant_type="int8"):
         return ActivationQuantize(layer, quant_type)
     elif isinstance(layer, keras.layers.Add):
         return AddQuantize(layer, quant_type)
+    elif isinstance(layer, keras.layers.Multiply):
+        return MultiplyQuantize(layer, quant_type)
     elif isinstance(layer, keras.layers.Concatenate):
         return ConcatenateQuantize(layer, quant_type)
     elif isinstance(layer, keras.layers.GlobalAveragePooling2D):
@@ -89,14 +93,15 @@ class QuantContainer:
             
         print("Finalizing calibration scale and zero-point parameters...")
         for name, q_layer in self.quant_layers.items():
-            q_layer.finalize_calibration()
+            q_layer.finalize_calibration(container=self)
         print("Calibration completed successfully.")
 
-    def quantized_infer(self, x):
+    def quantized_infer(self, x, mode="quantize"):
         """
         Runs quantized forward inference on the custom computational graph.
+        mode can be "quantize" (fake quantization) or "integer" (integer-only arithmetic).
         """
-        return self.run_graph(x, mode="quantize")
+        return self.run_graph(x, mode=mode)
 
     def run_graph(self, x, mode="quantize"):
         """
@@ -121,10 +126,17 @@ class QuantContainer:
             # InputLayer outputs are already fed into tensor_values
             if isinstance(layer, keras.layers.InputLayer):
                 layer_output = layer.output
-                if id(layer_output) not in tensor_values:
-                    # Fallback in case InputLayer is reached and not already mapped
-                    if not isinstance(x, dict):
-                        tensor_values[id(layer_output)] = x
+                q_layer = self.quant_layers[layer.name]
+                if mode == "calibrate":
+                    tensor_values[id(layer_output)] = q_layer.calibrate(x)
+                elif mode == "integer":
+                    tensor_values[id(layer_output)] = q_layer.quantized_infer_integer(x)
+                elif mode == "quantize":
+                    tensor_values[id(layer_output)] = q_layer.quantized_infer(x)
+                else:
+                    if id(layer_output) not in tensor_values or tensor_values[id(layer_output)] is x:
+                        if not isinstance(x, dict):
+                            tensor_values[id(layer_output)] = x
                 continue
                 
             q_layer = self.quant_layers[layer.name]
@@ -142,6 +154,8 @@ class QuantContainer:
                 out_val = q_layer.calibrate(inp_vals)
             elif mode == "quantize":
                 out_val = q_layer.quantized_infer(inp_vals)
+            elif mode == "integer":
+                out_val = q_layer.quantized_infer_integer(inp_vals)
             elif mode == "float":
                 # Fallback to standard float forward
                 inputs_tf = [tf.convert_to_tensor(v, dtype=tf.float32) for v in inp_vals] if isinstance(inp_vals, list) else tf.convert_to_tensor(inp_vals, dtype=tf.float32)
@@ -160,14 +174,26 @@ class QuantContainer:
                 
         # Return outputs matching model structure
         if len(self.model.outputs) == 1:
-            return tensor_values[id(self.model.outputs[0])]
+            out_val = tensor_values[id(self.model.outputs[0])]
         else:
-            return [tensor_values[id(out)] for out in self.model.outputs]
+            out_val = [tensor_values[id(out)] for out in self.model.outputs]
+            
+        if mode == "integer":
+            # Dequantize final integer outputs back to float for user/evaluation comparison
+            final_layer = self.model.layers[-1]
+            q_layer = self.quant_layers[final_layer.name]
+            if isinstance(out_val, list):
+                return [dequantize(val, q_layer.out_scale, q_layer.out_zp) for val in out_val]
+            else:
+                return dequantize(out_val, q_layer.out_scale, q_layer.out_zp)
+                
+        return out_val
 
-    def compare_layers(self, x):
+    def compare_layers(self, x, mode="quantize"):
         """
         Runs both float and quantized execution passes and returns a dictionary 
         containing comparison metrics (Max Diff, Mean Diff) for each layer.
+        mode can be 'quantize' or 'integer'.
         """
         tensor_values_float = {}
         tensor_values_quant = {}
@@ -190,10 +216,15 @@ class QuantContainer:
         for layer in self.model.layers:
             if isinstance(layer, keras.layers.InputLayer):
                 layer_output = layer.output
+                q_layer = self.quant_layers[layer.name]
+                if mode == "integer":
+                    tensor_values_quant[id(layer_output)] = q_layer.quantized_infer_integer(x)
+                else:
+                    tensor_values_quant[id(layer_output)] = q_layer.quantized_infer(x)
+                    
                 if id(layer_output) not in tensor_values_float:
                     if not isinstance(x, dict):
                         tensor_values_float[id(layer_output)] = x
-                        tensor_values_quant[id(layer_output)] = x
                 continue
                 
             q_layer = self.quant_layers[layer.name]
@@ -223,8 +254,11 @@ class QuantContainer:
             else:
                 inp_vals_q = tensor_values_quant[id(inputs_q)]
                 
-            out_val_q = q_layer.quantized_infer(inp_vals_q)
-            
+            if mode == "integer":
+                out_val_q = q_layer.quantized_infer_integer(inp_vals_q)
+            else:
+                out_val_q = q_layer.quantized_infer(inp_vals_q)
+                
             outputs_q = layer.output
             if isinstance(outputs_q, list):
                 for j, out_t in enumerate(outputs_q):
@@ -233,12 +267,20 @@ class QuantContainer:
                 tensor_values_quant[id(outputs_q)] = out_val_q
                 
             # --- Compute metrics ---
-            if isinstance(out_val_f, list):
-                max_diff = np.max([np.max(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q)])
-                mean_diff = np.mean([np.mean(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q)])
+            if mode == "integer":
+                if isinstance(out_val_q, list):
+                    out_val_q_float = [dequantize(val, q_layer.out_scale, q_layer.out_zp) for val in out_val_q]
+                else:
+                    out_val_q_float = dequantize(out_val_q, q_layer.out_scale, q_layer.out_zp)
             else:
-                max_diff = np.max(np.abs(out_val_f - out_val_q))
-                mean_diff = np.mean(np.abs(out_val_f - out_val_q))
+                out_val_q_float = out_val_q
+                
+            if isinstance(out_val_f, list):
+                max_diff = np.max([np.max(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q_float)])
+                mean_diff = np.mean([np.mean(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q_float)])
+            else:
+                max_diff = np.max(np.abs(out_val_f - out_val_q_float))
+                mean_diff = np.mean(np.abs(out_val_f - out_val_q_float))
                 
             comparison[layer.name] = {
                 "max_diff": max_diff,

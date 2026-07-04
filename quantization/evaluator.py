@@ -131,7 +131,7 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
     )
     print("Conversion successful.")
     
-def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_size=1):
+def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_size=1, infer_mode="quantize"):
     """
     Evaluates ONNX, Keras float, and Quantized models on the dataset,
     printing comparison logs and returning comparison metrics.
@@ -167,7 +167,7 @@ def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_siz
         out_keras = keras_model(tf.convert_to_tensor(x_batch)).numpy()
         
         # Quantized Inference
-        out_quant = quant_graph.quantized_infer(x_batch)
+        out_quant = quant_graph.quantized_infer(x_batch, mode=infer_mode)
         
         # Check alignment errors
         diff_onnx_keras = np.max(np.abs(out_onnx - out_keras))
@@ -228,14 +228,14 @@ def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_siz
         print("-" * 78)
         print(f"{'ONNX':<15} | {acc_onnx*100:<9.2f}% | {p_onnx*100:<9.2f}% | {r_onnx*100:<9.2f}% | {f_onnx*100:<9.2f}% | {kl_onnx:<10.6f}")
         print(f"{'Keras':<15} | {acc_keras*100:<9.2f}% | {p_keras*100:<9.2f}% | {r_keras*100:<9.2f}% | {f_keras*100:<9.2f}% | {kl_keras:<10.6f}")
-        print(f"{f'Quantized ({quant_graph.quant_type.upper()})':<15} | {acc_quant*100:<9.2f}% | {p_quant*100:<9.2f}% | {r_quant*100:<9.2f}% | {f_quant*100:<9.2f}% | {kl_quant:<10.6f}")
+        print(f"{f'Quantized ({quant_graph.quant_type.upper()}, {infer_mode.upper()})':<15} | {acc_quant*100:<9.2f}% | {p_quant*100:<9.2f}% | {r_quant*100:<9.2f}% | {f_quant*100:<9.2f}% | {kl_quant:<10.6f}")
     else:
         print("Note: Classification metrics (Accuracy, Precision, Recall, F1) were not calculated because labels were not available (dummy input mode).")
     print("========================================================")
 
-def run_evaluation(dataset_dir="dataset", quant_type="int8"):
+def run_evaluation(dataset_dir="dataset", quant_type="int8", infer_mode="quantize"):
     print("\n==================================================")
-    print(f"Starting YOLOv8-cls Quantization Assessment ({quant_type})")
+    print(f"Starting YOLOv8-cls Quantization Assessment ({quant_type}, {infer_mode})")
     print("==================================================")
     
     # 1. Download YOLOv8-cls nano
@@ -286,10 +286,11 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
     
     # 7. Evaluate
     print("\n--- Step 7: Evaluating Models ---")
-    evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_size=1)
+    evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_size=1, infer_mode=infer_mode)
 
 if __name__ == "__main__":
-    # Allow passing custom dataset folder and quantization type
+    # Allow passing custom dataset folder, quantization type, and inference mode
     dataset_folder = sys.argv[1] if len(sys.argv) > 1 else "dataset"
     quantization_type = sys.argv[2] if len(sys.argv) > 2 else "int8"
-    run_evaluation(dataset_folder, quantization_type)
+    inference_mode = sys.argv[3] if len(sys.argv) > 3 else "quantize"
+    run_evaluation(dataset_folder, quantization_type, inference_mode)
