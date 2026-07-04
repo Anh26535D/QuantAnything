@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from quantization.quant_layers import Conv2DQuantize
+from quantization.quant_layers import Conv2DQuantize, DepthwiseConv2DQuantize
 
 def test_conv2d_quantize_int8_per_channel():
     # Define a simple Conv2D layer
@@ -106,3 +106,30 @@ def test_conv2d_quantize_uint8():
     x_infer = np.random.uniform(0.0, 10.0, (1, 4, 4, 3)).astype(np.float32)
     out_quant = quant_layer.quantized_infer(x_infer)
     assert out_quant.shape == (1, 2, 2, 2)
+
+def test_depthwise_conv2d_quantize():
+    conv = keras.layers.DepthwiseConv2D(
+        kernel_size=(3, 3),
+        use_bias=True,
+        name="test_depthwise"
+    )
+    x_init = np.random.uniform(-1.0, 1.0, (2, 4, 4, 3)).astype(np.float32)
+    conv(tf.convert_to_tensor(x_init))
+    
+    # Weight shape: (3, 3, 3, 1) -> (H, W, C_in, depth_multiplier)
+    quant_layer = DepthwiseConv2DQuantize(conv, quant_type="int8", per_channel=True)
+    
+    x_cal = np.random.uniform(-5.0, 5.0, (5, 4, 4, 3)).astype(np.float32)
+    quant_layer.calibrate(x_cal)
+    quant_layer.finalize_calibration()
+    
+    # Assertions
+    assert quant_layer.in_scale > 0
+    assert len(quant_layer.w_scale) == 3  # Should have 3 scales (one per in_channel)
+    assert np.all(quant_layer.w_zp == 0)
+    assert len(quant_layer.b_scale) == 3
+    
+    x_infer = np.random.uniform(-5.0, 5.0, (1, 4, 4, 3)).astype(np.float32)
+    out_quant = quant_layer.quantized_infer(x_infer)
+    assert out_quant.shape == (1, 2, 2, 3)
+

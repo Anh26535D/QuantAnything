@@ -581,3 +581,103 @@ class ShapingQuantize(BaseQuantLayer):
         outputs_tf = self.original_layer(inputs_tf)
         outputs_np = outputs_tf.numpy()
         return outputs_np
+
+
+class DepthwiseConv2DQuantize(BaseQuantLayer):
+    def __init__(self, original_layer, quant_type="int8", per_channel=True):
+        super().__init__(original_layer, quant_type)
+        self.per_channel = per_channel
+        self.w_scale = None
+        self.w_zp = None
+        self.w_qmin = None
+        self.w_qmax = None
+        self.b_scale = None
+        self.b_zp = None
+        self.b_qmin = None
+        self.b_qmax = None
+
+    def finalize_calibration(self):
+        super().finalize_calibration()
+        
+        weights = self.original_layer.get_weights()
+        W = weights[0]
+        has_bias = len(weights) > 1
+        bias = weights[1] if has_bias else None
+        
+        num_bits, signed = parse_quant_type(self.quant_type)
+        if signed:
+            w_qmin = -(2**(num_bits - 1))
+            w_qmax = 2**(num_bits - 1) - 1
+        else:
+            w_qmin = 0
+            w_qmax = 2**num_bits - 1
+            
+        self.w_qmin, self.w_qmax = w_qmin, w_qmax
+        
+        if self.per_channel:
+            # DepthwiseConv2D weight shape: (filter_height, filter_width, in_channels, depth_multiplier)
+            in_channels = W.shape[-2]
+            self.w_scale = np.zeros(in_channels)
+            self.w_zp = np.zeros(in_channels, dtype=int)
+            for c in range(in_channels):
+                W_c = W[..., c, :]
+                sc, zp, _, _ = calculate_scale_zp(W_c.min(), W_c.max(), self.quant_type)
+                self.w_scale[c] = sc
+                self.w_zp[c] = zp
+        else:
+            sc, zp, _, _ = calculate_scale_zp(W.min(), W.max(), self.quant_type)
+            self.w_scale = sc
+            self.w_zp = zp
+            
+        if has_bias:
+            self.b_qmin = -2**31
+            self.b_qmax = 2**31 - 1
+            self.b_zp = 0
+            if self.per_channel:
+                self.b_scale = self.in_scale * self.w_scale
+            else:
+                self.b_scale = self.in_scale * self.w_scale
+
+    def quantized_infer(self, inputs):
+        if self.in_scale is None or self.w_scale is None:
+            raise ValueError(f"DepthwiseConv2DQuantize layer {self.name} is not calibrated.")
+            
+        import tensorflow as tf
+        
+        orig_weights = self.original_layer.get_weights()
+        W = orig_weights[0]
+        has_bias = len(orig_weights) > 1
+        bias = orig_weights[1] if has_bias else None
+        
+        # 1. Fake-quantize input
+        fake_in = fake_quantize(inputs, self.in_scale, self.in_zp, self.in_qmin, self.in_qmax)
+        
+        # 2. Fake-quantize weights
+        fake_W = np.zeros_like(W)
+        if self.per_channel:
+            in_channels = W.shape[-2]
+            for c in range(in_channels):
+                fake_W[..., c, :] = fake_quantize(
+                    W[..., c, :], self.w_scale[c], self.w_zp[c], self.w_qmin, self.w_qmax
+                )
+        else:
+            fake_W = fake_quantize(W, self.w_scale, self.w_zp, self.w_qmin, self.w_qmax)
+            
+        # 3. Fake-quantize bias
+        fake_bias = None
+        if has_bias:
+            fake_bias = fake_quantize(bias, self.b_scale, self.b_zp, self.b_qmin, self.b_qmax)
+            
+        # 4. Run convolution with fake weights
+        weights_to_set = [fake_W, fake_bias] if has_bias else [fake_W]
+        self.original_layer.set_weights(weights_to_set)
+        
+        inputs_tf = tf.convert_to_tensor(fake_in, dtype=tf.float32)
+        outputs_tf = self.original_layer(inputs_tf)
+        outputs_np = outputs_tf.numpy()
+        
+        self.original_layer.set_weights(orig_weights)
+        
+        # 5. Fake-quantize outputs
+        fake_out = fake_quantize(outputs_np, self.out_scale, self.out_zp, self.out_qmin, self.out_qmax)
+        return fake_out

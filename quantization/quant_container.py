@@ -11,7 +11,8 @@ from quantization.quant_layers import (
     AddQuantize,
     ConcatenateQuantize,
     GlobalAveragePooling2DQuantize,
-    ShapingQuantize
+    ShapingQuantize,
+    DepthwiseConv2DQuantize
 )
 
 def map_layer_to_quant(layer, quant_type="int8"):
@@ -22,6 +23,8 @@ def map_layer_to_quant(layer, quant_type="int8"):
     
     if isinstance(layer, keras.layers.InputLayer):
         return InputQuantize(layer, quant_type)
+    elif isinstance(layer, keras.layers.DepthwiseConv2D):
+        return DepthwiseConv2DQuantize(layer, quant_type)
     elif isinstance(layer, keras.layers.Conv2D):
         return Conv2DQuantize(layer, quant_type)
     elif isinstance(layer, keras.layers.BatchNormalization):

@@ -150,7 +150,10 @@ def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_siz
     total_samples = 0
     has_labels = False
     
-    for batch_idx, (x_batch, y_batch) in enumerate(dataset_loader):
+    from tqdm import tqdm
+    
+    progress_bar = tqdm(dataset_loader, desc="Evaluating batches", unit="batch")
+    for batch_idx, (x_batch, y_batch) in enumerate(progress_bar):
         if y_batch is not None:
             has_labels = True
             y_true_list.extend(y_batch)
@@ -193,7 +196,7 @@ def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_siz
         preds_keras_list.extend(preds_keras)
         preds_quant_list.extend(preds_quant)
             
-        print(f"Batch {batch_idx + 1}: Max ONNX vs Keras diff = {diff_onnx_keras:.6f} | Max Keras vs Quantized diff = {diff_keras_quant:.6f} | KL-Div = {np.mean(kl):.6f}")
+        progress_bar.write(f"Batch {batch_idx + 1}: Max ONNX vs Keras diff = {diff_onnx_keras:.6f} | Max Keras vs Quantized diff = {diff_keras_quant:.6f} | KL-Div = {np.mean(kl):.6f}")
         
     print("\n================== Evaluation Results ==================")
     print(f"Total samples evaluated: {total_samples}")
@@ -268,8 +271,17 @@ def run_evaluation(dataset_dir="dataset", quant_type="int8"):
     print("\n--- Step 6: Initializing QuantContainer and Calibrating ---")
     quant_graph = QuantContainer(keras_model, quant_type=quant_type)
     
-    # Use 3 batches of dummy calibration data
-    calib_data = [np.random.uniform(0.0, 1.0, (8, 3, 224, 224)).astype(np.float32) for _ in range(3)]
+    if os.path.exists(dataset_dir):
+        print("Loading real dataset images for calibration...")
+        # Load a small batch slice for calibration
+        calib_loader = load_dataset(dataset_dir, batch_size=4, limit_per_class=2, limit_classes=5)
+        calib_data = []
+        for x_batch, _ in calib_loader:
+            calib_data.append(x_batch)
+    else:
+        print("Dataset directory not found. Calibrating with dummy random inputs...")
+        calib_data = [np.random.uniform(0.0, 1.0, (8, 3, 224, 224)).astype(np.float32) for _ in range(3)]
+        
     quant_graph.calibrate(calib_data)
     
     # 7. Evaluate
