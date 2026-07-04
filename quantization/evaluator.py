@@ -41,10 +41,11 @@ def sanitize_onnx_model(model):
         vi.name = rename(vi.name)
     return model
 
-def load_dataset(dataset_dir, batch_size=16):
+def load_dataset(dataset_dir, batch_size=16, limit_per_class=2, limit_classes=5):
     """
     Loads images from the structured dataset directory: dataset_dir/class-name/images
     If directory is missing or empty, yields dummy batches of size batch_size.
+    To prevent RAM OOM, we support limit_per_class (default 2) and limit_classes (default 5).
     """
     if not os.path.exists(dataset_dir):
         print(f"Dataset directory '{dataset_dir}' not found. Using dummy inputs for validation.")
@@ -56,14 +57,22 @@ def load_dataset(dataset_dir, batch_size=16):
     image_paths = []
     labels = []
     class_names = sorted([d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))])
+    
+    if limit_classes is not None:
+        class_names = class_names[:limit_classes]
+        
     class_to_idx = {name: i for i, name in enumerate(class_names)}
     
     for class_name in class_names:
         class_path = os.path.join(dataset_dir, class_name)
+        count = 0
         for fname in os.listdir(class_path):
             if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
                 image_paths.append(os.path.join(class_path, fname))
                 labels.append(class_to_idx[class_name])
+                count += 1
+                if count >= limit_per_class:
+                    break
                 
     if not image_paths:
         print(f"No valid images found in '{dataset_dir}'. Using dummy inputs for validation.")
@@ -71,7 +80,7 @@ def load_dataset(dataset_dir, batch_size=16):
             yield np.random.uniform(0.0, 1.0, (batch_size, 3, 224, 224)).astype(np.float32), None
         return
         
-    print(f"Found {len(image_paths)} images across {len(class_names)} classes.")
+    print(f"Subsampled dataset loaded: {len(image_paths)} images across {len(class_names)} classes (limit={limit_per_class} per class).")
     
     for i in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[i:i+batch_size]
