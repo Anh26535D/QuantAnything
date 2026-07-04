@@ -228,7 +228,7 @@ def evaluate_model(ort_session, keras_model, quant_graph, dataset_dir, batch_siz
         print("-" * 78)
         print(f"{'ONNX':<15} | {acc_onnx*100:<9.2f}% | {p_onnx*100:<9.2f}% | {r_onnx*100:<9.2f}% | {f_onnx*100:<9.2f}% | {kl_onnx:<10.6f}")
         print(f"{'Keras':<15} | {acc_keras*100:<9.2f}% | {p_keras*100:<9.2f}% | {r_keras*100:<9.2f}% | {f_keras*100:<9.2f}% | {kl_keras:<10.6f}")
-        print(f"{'Quantized (INT8)':<15} | {acc_quant*100:<9.2f}% | {p_quant*100:<9.2f}% | {r_quant*100:<9.2f}% | {f_quant*100:<9.2f}% | {kl_quant:<10.6f}")
+        print(f"{f'Quantized ({quant_graph.quant_type.upper()})':<15} | {acc_quant*100:<9.2f}% | {p_quant*100:<9.2f}% | {r_quant*100:<9.2f}% | {f_quant*100:<9.2f}% | {kl_quant:<10.6f}")
     else:
         print("Note: Classification metrics (Accuracy, Precision, Recall, F1) were not calculated because labels were not available (dummy input mode).")
     print("========================================================")

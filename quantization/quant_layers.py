@@ -186,8 +186,12 @@ class Conv2DQuantize(BaseQuantLayer):
             self.w_zp = zp
             
         if has_bias:
-            self.b_qmin = -2**31
-            self.b_qmax = 2**31 - 1
+            if num_bits > 8:
+                self.b_qmin = -2**63
+                self.b_qmax = 2**63 - 1
+            else:
+                self.b_qmin = -2**31
+                self.b_qmax = 2**31 - 1
             self.b_zp = 0
             if self.per_channel:
                 self.b_scale = self.in_scale * self.w_scale
@@ -309,8 +313,12 @@ class DenseQuantize(BaseQuantLayer):
             self.w_zp = zp
             
         if has_bias:
-            self.b_qmin = -2**31
-            self.b_qmax = 2**31 - 1
+            if num_bits > 8:
+                self.b_qmin = -2**63
+                self.b_qmax = 2**63 - 1
+            else:
+                self.b_qmin = -2**31
+                self.b_qmax = 2**31 - 1
             self.b_zp = 0
             if self.per_channel:
                 self.b_scale = self.in_scale * self.w_scale
@@ -630,8 +638,12 @@ class DepthwiseConv2DQuantize(BaseQuantLayer):
             self.w_zp = zp
             
         if has_bias:
-            self.b_qmin = -2**31
-            self.b_qmax = 2**31 - 1
+            if num_bits > 8:
+                self.b_qmin = -2**63
+                self.b_qmax = 2**63 - 1
+            else:
+                self.b_qmin = -2**31
+                self.b_qmax = 2**31 - 1
             self.b_zp = 0
             if self.per_channel:
                 self.b_scale = self.in_scale * self.w_scale
