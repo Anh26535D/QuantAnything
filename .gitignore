@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Large model files and downloaded weights
+*.pt
+*.onnx
+*.keras
+yolov8n-cls.pt
+yolov8n-cls.onnx
+yolov8n-cls.keras
+runs/
+archive.zip
+imagenet-mini/
