@@ -36,3 +36,9 @@ build/
 # Cached quantization parameters
 *.qparams.json
 uv.lock
+
+# Notebook / ReID artifacts
+Market-1501*
+market1501.zip
+*.npz
+vit_*.onnx
