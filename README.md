@@ -143,6 +143,18 @@ Float parity with `onnxruntime` is ~1e-6. On a random-weight 4-block ViT
 ~0.92 for **int8** (naive per-tensor min/max): the residual stream has
 outliers. Outlier-aware calibration (Phase 2) is the next lever.
 
+### Export the optimized model
+
+The graph passes normally run in memory when a model is loaded. To get them
+as a file:
+```bash
+uv run python optimize_onnx.py vit_tiny.onnx -o vit_tiny_opt.onnx --check
+```
+The result is a standard ONNX model (opset >= 20 when `Gelu` appears) that
+runs in any runtime; `--check` compares it with the original on ONNX Runtime.
+On a timm `vit_tiny_patch16_224` export: 483 -> 307 nodes (the 48 bias `Add`
+nodes are fused again when the file is loaded back into the quantizer).
+
 ### Getting a real ViT without PyTorch
 
 `vit_from_npz.py` downloads Google's official ImageNet-21k -> 1k ViT checkpoints

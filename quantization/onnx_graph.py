@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import onnx
-from onnx import helper, numpy_helper
+from onnx import TensorProto, helper, numpy_helper
 
 
 @dataclass
@@ -42,6 +42,18 @@ class ValueInfo:
     name: str
     shape: list
     dtype: np.dtype
+
+
+def _clean(attrs):
+    """Node attributes in a form ``helper.make_node`` accepts."""
+    out = {}
+    for k, v in (attrs or {}).items():
+        if isinstance(v, np.ndarray):
+            v = numpy_helper.from_array(v)
+        elif isinstance(v, np.generic):
+            v = v.item()
+        out[k] = v
+    return out
 
 
 def _attr_value(attribute):
@@ -274,6 +286,122 @@ class OnnxGraph:
             raise ValueError("ONNX graph has a cycle or an undefined tensor")
         self.nodes = [self.nodes[i] for i in order]
         self._index()
+
+    # ----------------------------------------------------------- export ----
+    def to_model(self, opset=None):
+        """Writes the (optimized) graph back as a standard ONNX ``ModelProto``.
+
+        Internal forms are expanded to standard operators: the fused
+        ``MatMul(x, W, b)`` becomes ``MatMul`` + ``Add``, ``FusedElementwise``
+        is expanded to its nodes, ``Silu`` to ``Sigmoid`` + ``Mul``.
+        ``Gelu`` needs opset 20, so the model is written with
+        ``max(opset, 20)`` when it is present. Requires opset >= 13.
+        """
+        if self.opset < 13:
+            raise NotImplementedError("export needs a model with opset >= 13")
+        nodes = []
+
+        def emit(op, inputs, outputs, name, attrs=None):
+            nodes.append(
+                helper.make_node(
+                    op, inputs, outputs, name=name, **_clean(attrs)
+                )
+            )
+
+        consts = dict(self.initializers)
+        uses_gelu = False
+        for node in self.nodes:
+            op, attrs = node.op_type, dict(node.attrs)
+            if op == "FusedElementwise":
+                for sub in attrs["nodes"]:
+                    emit(
+                        sub.op_type,
+                        sub.inputs,
+                        sub.outputs,
+                        sub.name,
+                        sub.attrs,
+                    )
+                    uses_gelu |= sub.op_type == "Gelu"
+                for k, v in attrs["consts"].items():
+                    consts.setdefault(k, v)
+            elif op == "MatMul" and len(node.inputs) == 3:
+                mid = node.outputs[0] + "_nobias"
+                emit("MatMul", node.inputs[:2], [mid], node.name, attrs)
+                emit(
+                    "Add",
+                    [mid, node.inputs[2]],
+                    node.outputs,
+                    node.name + "_bias",
+                )
+            elif op == "Silu":
+                sig = node.outputs[0] + "_sigmoid"
+                emit("Sigmoid", node.inputs, [sig], node.name + "_sigmoid")
+                emit("Mul", [node.inputs[0], sig], node.outputs, node.name)
+            elif (
+                op == "Split"
+                and len(node.inputs) == 1
+                and "num_outputs" not in attrs
+            ):
+                attrs["num_outputs"] = len(node.outputs)
+                emit(op, node.inputs, node.outputs, node.name, attrs)
+            else:
+                uses_gelu |= op == "Gelu"
+                emit(op, node.inputs, node.outputs, node.name, attrs)
+
+        version = max(opset or self.opset, 20 if uses_gelu else 0)
+        if version >= 18:
+            for n in nodes:
+                if (
+                    n.op_type == "Split"
+                    and not any(a.name == "num_outputs" for a in n.attribute)
+                    and len(n.input) == 1
+                ):
+                    n.attribute.append(
+                        helper.make_attribute("num_outputs", len(n.output))
+                    )
+                if (
+                    n.op_type == "ReduceMean"
+                ):  # axes became an input (opset 18)
+                    axes = [a for a in n.attribute if a.name == "axes"]
+                    if axes:
+                        name = n.name + "_axes"
+                        consts[name] = np.array(axes[0].ints, dtype=np.int64)
+                        n.input.append(name)
+                        n.attribute.remove(axes[0])
+        used = {i for n in nodes for i in n.input if i}
+        inits = [
+            numpy_helper.from_array(np.asarray(v), k)
+            for k, v in consts.items()
+            if k in used
+        ]
+        graph = helper.make_graph(
+            nodes,
+            "optimized",
+            [
+                helper.make_tensor_value_info(
+                    v.name,
+                    helper.np_dtype_to_tensor_dtype(np.dtype(v.dtype)),
+                    v.shape,
+                )
+                for v in self.inputs
+            ],
+            [
+                helper.make_tensor_value_info(o, TensorProto.FLOAT, None)
+                for o in self.outputs
+            ],
+            inits,
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", version)]
+        )
+        model.ir_version = max(8, min(model.ir_version, 10))
+        model = onnx.shape_inference.infer_shapes(model)
+        onnx.checker.check_model(model)
+        return model
+
+    def save(self, path, opset=None):
+        """Saves the optimized graph as an ONNX file."""
+        onnx.save(self.to_model(opset), str(path))
 
     # ---------------------------------------------------------- helpers ----
     def is_constant(self, name):
