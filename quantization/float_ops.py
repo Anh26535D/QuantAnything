@@ -180,10 +180,13 @@ def _gemm(node, inputs, opset, **kw):
 
 @register("MatMul")
 def _matmul(node, inputs, opset, **kw):
-    y = np.matmul(inputs[0], inputs[1]).astype(np.float32)
-    if len(inputs) > 2 and inputs[2] is not None:  # fused bias (internal)
-        y = y + inputs[2]
-    return y
+    return np.matmul(inputs[0], inputs[1]).astype(np.float32)
+
+
+@register("LinearLayer")
+def _linear_layer(node, inputs, opset, **kw):
+    """``MatMul(x, W) + b``: one layer with the bias fused in."""
+    return (np.matmul(inputs[0], inputs[1]) + inputs[2]).astype(np.float32)
 
 
 @register("FusedElementwise")

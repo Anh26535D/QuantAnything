@@ -163,7 +163,11 @@ def embedding_model(model, tensor=None):
         while node is not None and node.op_type in ("Softmax", "Sigmoid"):
             tensor = node.input[0]
             node = producers.get(tensor)
-        if node is not None and node.op_type in ("Gemm", "MatMul"):
+        if node is not None and node.op_type in (
+            "Gemm",
+            "MatMul",
+            "LinearLayer",
+        ):
             tensor = node.input[0]
     if tensor not in producers and tensor not in {i.name for i in graph.input}:
         raise ValueError(f"tensor '{tensor}' not found in the model")

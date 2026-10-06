@@ -44,6 +44,25 @@ class ValueInfo:
     dtype: np.dtype
 
 
+LINEAR_DOMAIN = "quantanything"
+
+
+def _linear_layer_function(opset):
+    """ONNX local function ``LinearLayer(X, W, B) = MatMul(X, W) + B``."""
+    return helper.make_function(
+        LINEAR_DOMAIN,
+        "LinearLayer",
+        ["X", "W", "B"],
+        ["Y"],
+        [
+            helper.make_node("MatMul", ["X", "W"], ["XW"]),
+            helper.make_node("Add", ["XW", "B"], ["Y"]),
+        ],
+        [helper.make_opsetid("", opset)],
+        doc_string="Linear layer: Y = X @ W + B (MatMul with fused bias).",
+    )
+
+
 def _clean(attrs):
     """Node attributes in a form ``helper.make_node`` accepts."""
     out = {}
@@ -288,12 +307,15 @@ class OnnxGraph:
         self._index()
 
     # ----------------------------------------------------------- export ----
-    def to_model(self, opset=None):
+    def to_model(self, opset=None, linear_as_function=True):
         """Writes the (optimized) graph back as a standard ONNX ``ModelProto``.
 
-        Internal forms are expanded to standard operators: the fused
-        ``MatMul(x, W, b)`` becomes ``MatMul`` + ``Add``, ``FusedElementwise``
-        is expanded to its nodes, ``Silu`` to ``Sigmoid`` + ``Mul``.
+        ``LinearLayer(x, W, b)`` (a ``MatMul`` with its bias) is written as a
+        call of the ONNX local function ``quantanything::LinearLayer`` (one
+        node in viewers, inlined by runtimes); with
+        ``linear_as_function=False`` it is expanded to ``MatMul`` + ``Add``.
+        ``FusedElementwise`` is expanded to its nodes, ``Silu`` to
+        ``Sigmoid`` + ``Mul``.
         ``Gelu`` needs opset 20, so the model is written with
         ``max(opset, 20)`` when it is present. Requires opset >= 13.
         """
@@ -310,6 +332,7 @@ class OnnxGraph:
 
         consts = dict(self.initializers)
         uses_gelu = False
+        uses_linear = False
         for node in self.nodes:
             op, attrs = node.op_type, dict(node.attrs)
             if op == "FusedElementwise":
@@ -324,15 +347,27 @@ class OnnxGraph:
                     uses_gelu |= sub.op_type == "Gelu"
                 for k, v in attrs["consts"].items():
                     consts.setdefault(k, v)
-            elif op == "MatMul" and len(node.inputs) == 3:
-                mid = node.outputs[0] + "_nobias"
-                emit("MatMul", node.inputs[:2], [mid], node.name, attrs)
-                emit(
-                    "Add",
-                    [mid, node.inputs[2]],
-                    node.outputs,
-                    node.name + "_bias",
-                )
+            elif op == "LinearLayer":
+                if linear_as_function:
+                    uses_linear = True
+                    nodes.append(
+                        helper.make_node(
+                            "LinearLayer",
+                            node.inputs,
+                            node.outputs,
+                            name=node.name,
+                            domain=LINEAR_DOMAIN,
+                        )
+                    )
+                else:
+                    mid = node.outputs[0] + "_nobias"
+                    emit("MatMul", node.inputs[:2], [mid], node.name)
+                    emit(
+                        "Add",
+                        [mid, node.inputs[2]],
+                        node.outputs,
+                        node.name + "_bias",
+                    )
             elif op == "Silu":
                 sig = node.outputs[0] + "_sigmoid"
                 emit("Sigmoid", node.inputs, [sig], node.name + "_sigmoid")
@@ -391,17 +426,22 @@ class OnnxGraph:
             ],
             inits,
         )
+        imports = [helper.make_opsetid("", version)]
+        functions = []
+        if uses_linear:
+            imports.append(helper.make_opsetid(LINEAR_DOMAIN, 1))
+            functions.append(_linear_layer_function(version))
         model = helper.make_model(
-            graph, opset_imports=[helper.make_opsetid("", version)]
+            graph, opset_imports=imports, functions=functions
         )
         model.ir_version = max(8, min(model.ir_version, 10))
         model = onnx.shape_inference.infer_shapes(model)
         onnx.checker.check_model(model)
         return model
 
-    def save(self, path, opset=None):
+    def save(self, path, opset=None, linear_as_function=True):
         """Saves the optimized graph as an ONNX file."""
-        onnx.save(self.to_model(opset), str(path))
+        onnx.save(self.to_model(opset, linear_as_function), str(path))
 
     # ---------------------------------------------------------- helpers ----
     def is_constant(self, name):

@@ -67,8 +67,8 @@ static inference with 32/64-bit integer accumulation.
    - **Graph fusions** (`graph_passes.py`, on by default): PyTorch-style
      decomposed LayerNorm becomes one `LayerNormalization`; element-wise
      subgraphs with one dynamic input (SiLU, decomposed GELU, `x * s + t`)
-     become a single lookup table; `MatMul + Add(bias)` joins the integer
-     accumulator; static `Shape -> Gather -> Expand` chains are folded.
+     become a single lookup table; `MatMul + Add(bias)` becomes one `LinearLayer` (bias joins the integer
+     accumulator); static `Shape -> Gather -> Expand` chains are folded.
      Exact algebraic folds: `Conv + BatchNorm` -> `Conv`, LayerNorm
      gain/shift into the following linear layers, the attention `1/sqrt(d)`
      scale into the query weights, and `Gather(LayerNorm(x))` ->
@@ -151,9 +151,10 @@ as a file:
 uv run python optimize_onnx.py vit_tiny.onnx -o vit_tiny_opt.onnx --check
 ```
 The result is a standard ONNX model (opset >= 20 when `Gelu` appears) that
-runs in any runtime; `--check` compares it with the original on ONNX Runtime.
-On a timm `vit_tiny_patch16_224` export: 483 -> 307 nodes (the 48 bias `Add`
-nodes are fused again when the file is loaded back into the quantizer).
+runs in any runtime. `MatMul + bias` is one `LinearLayer` node (an ONNX local
+function in domain `quantanything`, inlined by runtimes; `--expand-linear`
+writes plain `MatMul` + `Add`); `--check` compares it with the original on ONNX Runtime.
+On a timm `vit_tiny_patch16_224` export: 483 -> 259 nodes.
 
 ### Getting a real ViT without PyTorch
 

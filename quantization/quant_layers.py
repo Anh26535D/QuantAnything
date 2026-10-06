@@ -664,7 +664,7 @@ def map_node_to_quant(node, graph, quant_type="int8", per_channel=True):
         if w.ndim == 4 and bias_ok:
             return ConvQuantize(*args)
     if (
-        op in ("Gemm", "MatMul")
+        op in ("Gemm", "MatMul", "LinearLayer")
         and len(node.inputs) > 1
         and const(node.inputs[1])
     ):

@@ -29,9 +29,11 @@ def test_vit_roundtrip_is_standard_and_equivalent():
     onnx.checker.check_model(exported)
     ops = [n.op_type for n in exported.graph.node]
     assert not INTERNAL & set(ops)
-    assert all(
-        len(n.input) == 2 for n in exported.graph.node if n.op_type == "MatMul"
+    linear = [n for n in exported.graph.node if n.op_type == "LinearLayer"]
+    assert len(linear) == 8 and all(
+        n.domain == "quantanything" for n in linear
     )
+    assert [f.name for f in exported.functions] == ["LinearLayer"]
     assert "Gelu" in ops and "Mul" not in ops  # folded scales / GELU
     assert exported.opset_import[0].version == 20
     np.testing.assert_allclose(_run(exported, x), _run(model, x), atol=1e-5)
@@ -104,7 +106,9 @@ def test_saved_file_quantizes_like_the_original(tmp_path):
         a.run_graph(cal[0], "integer"), b.run_graph(cal[0], "integer")
     )
     again = OnnxGraph.from_model(str(path))
-    assert {k: v for k, v in again.fusions.items() if v} == {"matmul_bias": 4}
+    # LinearLayer is already in the file: nothing is left to fuse
+    assert not any(v for k, v in again.fusions.items() if k == "matmul_bias")
+    assert [n.op_type for n in again.nodes].count("LinearLayer") == 4
 
 
 def test_unused_initializers_are_dropped(tmp_path):
@@ -124,3 +128,17 @@ def test_optimize_onnx_cli(tmp_path, capsys):
     n0, _ = optimize_onnx.summarize(str(src))
     n1, ops = optimize_onnx.summarize(str(dst))
     assert n1 < n0 and "LayerNormalization" in ops
+
+
+def test_linear_layer_can_be_expanded_for_tools_without_functions():
+    model = build_vit(batch=2, depth=1, qk_scale="separate")
+    x = (
+        np.random.default_rng(0)
+        .standard_normal((2, 3, 32, 32))
+        .astype(np.float32)
+    )
+    exported = OnnxGraph.from_model(model).to_model(linear_as_function=False)
+    ops = [n.op_type for n in exported.graph.node]
+    assert "LinearLayer" not in ops and not exported.functions
+    assert [o.domain for o in exported.opset_import] == [""]
+    np.testing.assert_allclose(_run(exported, x), _run(model, x), atol=1e-5)

@@ -5,6 +5,10 @@ Cast / Shape / scale chains removed, LayerNorm and GELU recognised,
 Conv+BN and constant Mul folded into weights, ...) and the result is saved
 as a standard ONNX file that runs in any runtime.
 
+``MatMul + bias`` is written as one ``LinearLayer`` node (an ONNX local
+function in domain ``quantanything``; ``--expand-linear`` writes plain
+``MatMul`` + ``Add`` for tools that do not support functions).
+
 Usage:
     uv run python optimize_onnx.py vit_tiny.onnx -o vit_tiny_opt.onnx
 """
@@ -39,6 +43,11 @@ def main(argv=None):
     p.add_argument("input")
     p.add_argument("-o", "--output", default=None)
     p.add_argument(
+        "--expand-linear",
+        action="store_true",
+        help="write MatMul + Add instead of LinearLayer functions",
+    )
+    p.add_argument(
         "--check",
         action="store_true",
         help="compare outputs with ONNX Runtime on random input",
@@ -47,7 +56,7 @@ def main(argv=None):
     out = args.output or args.input.replace(".onnx", "_opt.onnx")
 
     graph = OnnxGraph.from_model(args.input)
-    graph.save(out)
+    graph.save(out, linear_as_function=not args.expand_linear)
     n0, _ = summarize(args.input)
     n1, ops = summarize(out)
     print(f"{args.input}: {n0} nodes -> {out}: {n1} nodes")

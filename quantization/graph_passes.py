@@ -66,7 +66,10 @@ def _is_scalar_const(graph, name):
 
 # ------------------------------------------------------------ matmul bias ----
 def fuse_matmul_bias(graph):
-    """``MatMul(x, W) + b`` (``W`` 2-D, ``b`` a length-N constant)."""
+    """``MatMul(x, W) + b`` -> ``LinearLayer(x, W, b)``.
+
+    ``W`` is a 2-D constant and ``b`` a length-N constant.
+    """
     cons = _consumers(graph)
     remove, replace = set(), {}
     for node in graph.nodes:
@@ -89,7 +92,7 @@ def fuse_matmul_bias(graph):
             continue
         replace[id(node)] = Node(
             node.name,
-            "MatMul",
+            "LinearLayer",
             [node.inputs[0], node.inputs[1], other[0]],
             list(add.outputs),
             dict(node.attrs),
@@ -344,7 +347,7 @@ def _trace_qkv(graph, cons, prod, tensor):
         shape.size == 5
         and shape[2] == 3
         and mm
-        and mm.op_type == "MatMul"
+        and mm.op_type == "LinearLayer"
         and len(mm.inputs) == 3
         and single(mm.outputs[0])
     ):
@@ -451,7 +454,7 @@ def fold_layernorm_affine(graph):
             w = init[u.inputs[1]]
             if w.ndim != 2:
                 return False
-            if u.op_type == "MatMul":
+            if u.op_type in ("MatMul", "LinearLayer"):
                 ok_k = w.shape[0] == gamma.size
             elif (
                 u.op_type == "Gemm"
@@ -489,6 +492,8 @@ def fold_layernorm_affine(graph):
                     graph, u.name + "_lnbias", (old + delta).astype(np.float32)
                 ),
             ]
+            if u.op_type == "MatMul":  # it has a bias now
+                u.op_type = "LinearLayer"
         ln.inputs = [
             ln.inputs[0],
             _new_const(graph, ln.inputs[1] + "_one", np.ones_like(gamma)),
@@ -753,7 +758,7 @@ def fold_mul_into_linear(graph):
         lin = prod.get(y)
         if not (
             lin
-            and lin.op_type in ("Conv", "MatMul", "Gemm")
+            and lin.op_type in ("Conv", "MatMul", "Gemm", "LinearLayer")
             and len(cons[y]) == 1
             and y not in graph.outputs
             and id(lin) not in removed
