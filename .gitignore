@@ -25,3 +25,14 @@ yolov8n-cls.keras
 runs/
 archive.zip
 imagenet-mini/
+
+# Compiled kernels (built on first import / by CMake)
+quantization/kernels/_build/
+build/
+*.so
+*.dylib
+*.dll
+
+# Cached quantization parameters
+*.qparams.json
+uv.lock
