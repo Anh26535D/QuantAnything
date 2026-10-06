@@ -183,6 +183,25 @@ def _matmul(node, inputs, opset, **kw):
     return np.matmul(inputs[0], inputs[1]).astype(np.float32)
 
 
+@register("MultiHeadAttention")
+def _multi_head_attention(node, inputs, opset, **kw):
+    """``softmax(q k^T) v`` over heads of a fused QKV tensor.
+
+    Input ``[B, T, 3 * H * hd]`` laid out as ``[3, H, hd]`` (as produced by a
+    single QKV projection); output ``[B, T, H * hd]``. Any ``1/sqrt(d)`` scale
+    is expected to be folded into the weights already.
+    """
+    x = inputs[0]
+    heads, hd = node.attr("num_heads"), node.attr("head_dim")
+    b, t = x.shape[:2]
+    q, k, v = x.reshape(b, t, 3, heads, hd).transpose(2, 0, 3, 1, 4)
+    logits = np.matmul(q, k.transpose(0, 1, 3, 2)).astype(np.float64)
+    e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)
+    out = np.matmul(probs, v).transpose(0, 2, 1, 3)
+    return out.reshape(b, t, heads * hd).astype(np.float32)
+
+
 @register("LinearLayer")
 def _linear_layer(node, inputs, opset, **kw):
     """``MatMul(x, W) + b``: one layer with the bias fused in."""

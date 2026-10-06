@@ -246,3 +246,36 @@ def build_vit(
         transB=1,
     )
     return b.build("images", [batch, 3, img, img], y, [batch, classes])
+
+
+def attention_core(b, qkv, batch, tokens, heads, hd):
+    """The attention core as exported by PyTorch (no projections).
+
+    ``qkv`` is a ``[batch, tokens, 3 * heads * hd]`` tensor; the result is
+    ``[batch, tokens, heads * hd]``.
+    """
+    split_attrs = {"num_outputs": 3} if b.opset >= 18 else {}
+    t = b.op(
+        "Transpose",
+        [
+            b.op(
+                "Reshape",
+                [
+                    qkv,
+                    b.const(np.array([batch, tokens, 3, heads, hd], np.int64)),
+                ],
+            )
+        ],
+        perm=[2, 0, 3, 1, 4],
+    )
+    q, k, v = [
+        b.op("Squeeze", [s, b.const(np.array([0], np.int64))])
+        for s in b.op("Split", [t], n_out=3, axis=0, **split_attrs)
+    ]
+    att = b.op("MatMul", [q, b.op("Transpose", [k], perm=[0, 1, 3, 2])])
+    o = b.op("MatMul", [b.op("Softmax", [att], axis=-1), v])
+    o = b.op("Transpose", [o], perm=[0, 2, 1, 3])
+    return b.op(
+        "Reshape",
+        [o, b.const(np.array([batch, tokens, heads * hd], np.int64))],
+    )

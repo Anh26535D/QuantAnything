@@ -13,6 +13,8 @@ leave the graph untouched otherwise.
 * :func:`fold_attention_scale`, :func:`fold_layernorm_affine`,
   :func:`hoist_gather_before_layernorm`: exact algebraic simplifications
   that remove quantization points and per-channel gains,
+* :func:`fuse_attention`: the 12-node attention core -> one
+  ``MultiHeadAttention`` node,
 * :func:`fuse_elementwise`: any element-wise subgraph with a single dynamic
   input and scalar constants (SiLU, decomposed GELU, ``x * s + t``, ...) ->
   one ``FusedElementwise`` node that is quantized as a single lookup table.
@@ -426,6 +428,129 @@ def fold_attention_scale(graph):
     return len(removed)
 
 
+def fuse_attention(graph):
+    """Collapses one attention core into ``MultiHeadAttention``.
+
+    Matches the 12-node chain ``Reshape [B,T,3,H,hd] -> Transpose -> Split ->
+    3x Squeeze -> Transpose(k) -> MatMul(q,k^T) -> Softmax -> MatMul(.,v) ->
+    Transpose -> Reshape [B,T,D]`` (run after :func:`fold_attention_scale`).
+    """
+    cons = _consumers(graph)
+    prod = {o: n for n in graph.nodes for o in n.outputs}
+    init = graph.initializers
+    fused, removed = {}, set()
+
+    def single(t):
+        return len(cons[t]) == 1 and t not in graph.outputs
+
+    def perm(node, expect):
+        return (
+            node
+            and node.op_type == "Transpose"
+            and list(node.attr("perm", [])) == list(expect)
+        )
+
+    def squeeze0(node):
+        if not (node and node.op_type == "Squeeze"):
+            return False
+        axes = (
+            init[node.inputs[1]].reshape(-1).tolist()
+            if len(node.inputs) > 1 and node.inputs[1] in init
+            else node.attr("axes")
+        )
+        return axes is not None and list(axes) == [0]
+
+    for sm in graph.nodes:
+        if sm.op_type != "Softmax" or sm.attr("axis", -1) not in (-1, 3):
+            continue
+        att = prod.get(sm.inputs[0])
+        if not (
+            att
+            and att.op_type == "MatMul"
+            and len(att.inputs) == 2
+            and single(att.outputs[0])
+            and not any(i in init for i in att.inputs)
+        ):
+            continue
+        kt = prod.get(att.inputs[1])
+        if not (perm(kt, (0, 1, 3, 2)) and single(kt.outputs[0])):
+            continue
+        qs, ks = prod.get(att.inputs[0]), prod.get(kt.inputs[0])
+        users = cons[sm.outputs[0]]
+        if not (
+            len(users) == 1
+            and users[0].op_type == "MatMul"
+            and users[0].inputs[0] == sm.outputs[0]
+            and single(sm.outputs[0])
+        ):
+            continue
+        pv = users[0]
+        vs = prod.get(pv.inputs[1])
+        if not (squeeze0(qs) and squeeze0(ks) and squeeze0(vs)):
+            continue
+        if not all(single(n.outputs[0]) for n in (qs, ks, vs)):
+            continue
+        sp = prod.get(qs.inputs[0])
+        if not (
+            sp
+            and sp.op_type == "Split"
+            and len(sp.outputs) == 3
+            and [qs.inputs[0], ks.inputs[0], vs.inputs[0]] == sp.outputs
+            and all(single(o) for o in sp.outputs)
+        ):
+            continue
+        tr = prod.get(sp.inputs[0])
+        if not (perm(tr, (2, 0, 3, 1, 4)) and single(tr.outputs[0])):
+            continue
+        rs = prod.get(tr.inputs[0])
+        if not (
+            rs
+            and rs.op_type == "Reshape"
+            and rs.inputs[1] in init
+            and single(rs.outputs[0])
+        ):
+            continue
+        shape_in = init[rs.inputs[1]].reshape(-1).astype(int).tolist()
+        if len(shape_in) != 5 or shape_in[2] != 3:
+            continue
+        ot_list = cons[pv.outputs[0]]
+        if not (single(pv.outputs[0]) and perm(ot_list[0], (0, 2, 1, 3))):
+            continue
+        ot = ot_list[0]
+        out_users = cons[ot.outputs[0]]
+        if not (
+            single(ot.outputs[0])
+            and out_users[0].op_type == "Reshape"
+            and out_users[0].inputs[1] in init
+        ):
+            continue
+        rs2 = out_users[0]
+        shape_out = init[rs2.inputs[1]].reshape(-1).astype(int).tolist()
+        b, t, _, heads, hd = shape_in
+        if shape_out != [b, t, heads * hd]:
+            continue
+        chain = [rs, tr, sp, qs, ks, vs, kt, att, sm, pv, ot, rs2]
+        fused[id(rs2)] = Node(
+            rs2.name + "_mha",
+            "MultiHeadAttention",
+            [rs.inputs[0]],
+            list(rs2.outputs),
+            {
+                "num_heads": heads,
+                "head_dim": hd,
+                "shape_in": shape_in,
+                "shape_out": shape_out,
+            },
+        )
+        removed.update(id(n) for n in chain if n is not rs2)
+    if fused:
+        graph.nodes = [
+            fused.get(id(n), n) for n in graph.nodes if id(n) not in removed
+        ]
+        graph._index()
+    return len(fused)
+
+
 def fold_layernorm_affine(graph):
     """Moves a LayerNorm's ``gamma`` / ``beta`` into the next linear layers.
 
@@ -821,6 +946,7 @@ def run_passes(graph):
         "const_ops": merge_constant_ops(graph),
         "mul_into_linear": fold_mul_into_linear(graph),
         "attention_scale": fold_attention_scale(graph),
+        "attention": fuse_attention(graph),
         "hoist_gather": hoist_gather_before_layernorm(graph),
         "layernorm_affine": fold_layernorm_affine(graph),
     }

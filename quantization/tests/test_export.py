@@ -33,7 +33,11 @@ def test_vit_roundtrip_is_standard_and_equivalent():
     assert len(linear) == 8 and all(
         n.domain == "quantanything" for n in linear
     )
-    assert [f.name for f in exported.functions] == ["LinearLayer"]
+    assert [f.name for f in exported.functions] == [
+        "LinearLayer",
+        "MultiHeadAttention",
+    ]
+    assert "Softmax" not in ops and ops.count("MultiHeadAttention") == 2
     assert "Gelu" in ops and "Mul" not in ops  # folded scales / GELU
     assert exported.opset_import[0].version == 20
     np.testing.assert_allclose(_run(exported, x), _run(model, x), atol=1e-5)
@@ -137,7 +141,7 @@ def test_linear_layer_can_be_expanded_for_tools_without_functions():
         .standard_normal((2, 3, 32, 32))
         .astype(np.float32)
     )
-    exported = OnnxGraph.from_model(model).to_model(linear_as_function=False)
+    exported = OnnxGraph.from_model(model).to_model(use_functions=False)
     ops = [n.op_type for n in exported.graph.node]
     assert "LinearLayer" not in ops and not exported.functions
     assert [o.domain for o in exported.opset_import] == [""]

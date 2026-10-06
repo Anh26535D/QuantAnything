@@ -118,7 +118,7 @@ def test_graph_is_quantizable(weights):
     g = OnnxGraph.from_model(vit_from_npz.build_onnx(npz))
     assert g.fusions["matmul_bias"] == 4 * DEPTH  # qkv, proj, fc1, fc2
     ops = {n.op_type for n in g.nodes}
-    assert {"LayerNormalization", "Gelu", "Softmax"} <= ops
+    assert {"LayerNormalization", "Gelu", "MultiHeadAttention"} <= ops
 
 
 def test_variants_point_to_google_storage():

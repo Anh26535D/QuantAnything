@@ -63,6 +63,82 @@ def _linear_layer_function(opset):
     )
 
 
+def _int_constant(name, value=None, ref=None):
+    """``Constant`` node holding an int64 vector (literal or attribute ref)."""
+    if ref is None:
+        return helper.make_node(
+            "Constant",
+            [],
+            [name],
+            value=numpy_helper.from_array(np.asarray(value, dtype=np.int64)),
+        )
+    node = helper.make_node("Constant", [], [name])
+    attr = onnx.AttributeProto()
+    attr.name = "value_ints"
+    attr.type = onnx.AttributeProto.INTS
+    attr.ref_attr_name = ref
+    node.attribute.append(attr)
+    return node
+
+
+def _mha_nodes(x, y, prefix, version, shapes=None):
+    """Standard-op body of ``MultiHeadAttention`` (``x``: fused QKV).
+
+    ``shapes=None`` reads the reshape targets from the function attributes
+    ``shape_in`` / ``shape_out``; otherwise ``(shape_in, shape_out)`` literals.
+    """
+    n = lambda s: f"{prefix}{s}"  # noqa: E731
+    lit_in, lit_out = shapes if shapes else (None, None)
+    nodes = [
+        _int_constant(n("shape_in"), lit_in, None if shapes else "shape_in"),
+        _int_constant(
+            n("shape_out"), lit_out, None if shapes else "shape_out"
+        ),
+        _int_constant(n("axes0"), [0]),
+        helper.make_node("Reshape", [x, n("shape_in")], [n("r")]),
+        helper.make_node(
+            "Transpose", [n("r")], [n("t")], perm=[2, 0, 3, 1, 4]
+        ),
+    ]
+    split_attrs = {"num_outputs": 3} if version >= 18 else {}
+    nodes.append(
+        helper.make_node(
+            "Split",
+            [n("t")],
+            [n("q0"), n("k0"), n("v0")],
+            axis=0,
+            **split_attrs,
+        )
+    )
+    for name in ("q", "k", "v"):
+        nodes.append(
+            helper.make_node("Squeeze", [n(name + "0"), n("axes0")], [n(name)])
+        )
+    nodes += [
+        helper.make_node("Transpose", [n("k")], [n("kt")], perm=[0, 1, 3, 2]),
+        helper.make_node("MatMul", [n("q"), n("kt")], [n("att")]),
+        helper.make_node("Softmax", [n("att")], [n("p")], axis=-1),
+        helper.make_node("MatMul", [n("p"), n("v")], [n("o")]),
+        helper.make_node("Transpose", [n("o")], [n("ot")], perm=[0, 2, 1, 3]),
+        helper.make_node("Reshape", [n("ot"), n("shape_out")], [y]),
+    ]
+    return nodes
+
+
+def _mha_function(opset):
+    """ONNX local function ``quantanything::MultiHeadAttention``."""
+    return helper.make_function(
+        LINEAR_DOMAIN,
+        "MultiHeadAttention",
+        ["X"],
+        ["Y"],
+        _mha_nodes("X", "Y", "", opset),
+        [helper.make_opsetid("", opset)],
+        attributes=["num_heads", "head_dim", "shape_in", "shape_out"],
+        doc_string="softmax(q k^T) v over the heads of a fused QKV tensor.",
+    )
+
+
 def _clean(attrs):
     """Node attributes in a form ``helper.make_node`` accepts."""
     out = {}
@@ -307,13 +383,13 @@ class OnnxGraph:
         self._index()
 
     # ----------------------------------------------------------- export ----
-    def to_model(self, opset=None, linear_as_function=True):
+    def to_model(self, opset=None, use_functions=True):
         """Writes the (optimized) graph back as a standard ONNX ``ModelProto``.
 
         ``LinearLayer(x, W, b)`` (a ``MatMul`` with its bias) is written as a
         call of the ONNX local function ``quantanything::LinearLayer`` (one
         node in viewers, inlined by runtimes); with
-        ``linear_as_function=False`` it is expanded to ``MatMul`` + ``Add``.
+        ``use_functions=False`` it is expanded to ``MatMul`` + ``Add``.
         ``FusedElementwise`` is expanded to its nodes, ``Silu`` to
         ``Sigmoid`` + ``Mul``.
         ``Gelu`` needs opset 20, so the model is written with
@@ -333,6 +409,7 @@ class OnnxGraph:
         consts = dict(self.initializers)
         uses_gelu = False
         uses_linear = False
+        uses_mha = False
         for node in self.nodes:
             op, attrs = node.op_type, dict(node.attrs)
             if op == "FusedElementwise":
@@ -347,8 +424,26 @@ class OnnxGraph:
                     uses_gelu |= sub.op_type == "Gelu"
                 for k, v in attrs["consts"].items():
                     consts.setdefault(k, v)
+            elif op == "MultiHeadAttention":
+                if use_functions:
+                    uses_mha = True
+                    nodes.append(
+                        helper.make_node(
+                            "MultiHeadAttention",
+                            node.inputs,
+                            node.outputs,
+                            name=node.name,
+                            domain=LINEAR_DOMAIN,
+                            num_heads=attrs["num_heads"],
+                            head_dim=attrs["head_dim"],
+                            shape_in=attrs["shape_in"],
+                            shape_out=attrs["shape_out"],
+                        )
+                    )
+                else:
+                    nodes.append(("MHA", node))
             elif op == "LinearLayer":
-                if linear_as_function:
+                if use_functions:
                     uses_linear = True
                     nodes.append(
                         helper.make_node(
@@ -384,6 +479,21 @@ class OnnxGraph:
                 emit(op, node.inputs, node.outputs, node.name, attrs)
 
         version = max(opset or self.opset, 20 if uses_gelu else 0)
+        expanded = []
+        for item in nodes:
+            if isinstance(item, tuple):
+                node = item[1]
+                a = node.attrs
+                expanded += _mha_nodes(
+                    node.inputs[0],
+                    node.outputs[0],
+                    node.name + "/",
+                    version,
+                    (a["shape_in"], a["shape_out"]),
+                )
+            else:
+                expanded.append(item)
+        nodes = expanded
         if version >= 18:
             for n in nodes:
                 if (
@@ -428,9 +538,12 @@ class OnnxGraph:
         )
         imports = [helper.make_opsetid("", version)]
         functions = []
-        if uses_linear:
+        if uses_linear or uses_mha:
             imports.append(helper.make_opsetid(LINEAR_DOMAIN, 1))
+        if uses_linear:
             functions.append(_linear_layer_function(version))
+        if uses_mha:
+            functions.append(_mha_function(version))
         model = helper.make_model(
             graph, opset_imports=imports, functions=functions
         )
@@ -439,9 +552,9 @@ class OnnxGraph:
         onnx.checker.check_model(model)
         return model
 
-    def save(self, path, opset=None, linear_as_function=True):
+    def save(self, path, opset=None, use_functions=True):
         """Saves the optimized graph as an ONNX file."""
-        onnx.save(self.to_model(opset, linear_as_function), str(path))
+        onnx.save(self.to_model(opset, use_functions), str(path))
 
     # ---------------------------------------------------------- helpers ----
     def is_constant(self, name):

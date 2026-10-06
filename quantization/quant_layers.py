@@ -402,6 +402,96 @@ class GemmQuantize(_WeightedLayer):
         return [out.reshape(self._out_shape(x))]
 
 
+class MultiHeadAttentionQuantize(BaseQuantLayer):
+    """Attention core with integer ``q k^T`` and ``p v`` matrix products.
+
+    ``q``, ``k`` and ``v`` come from one QKV tensor, so they share its scale
+    and zero point. ``q k^T`` is accumulated in integers and dequantized with
+    ``s_x ** 2``; the softmax runs in float on that (small) tensor and its
+    result is quantized with a *fixed* probability scale ``1 / (qmax - qmin)``
+    (the range ``[0, 1]`` is known, no calibration needed); ``p v`` is again
+    an integer product requantized to the output grid.
+    """
+
+    def _select_data_inputs(self):
+        return [self.node.inputs[0]]
+
+    def prepare(self):
+        qp, out = self.in_qp[0], self.out_qp[0]
+        self.p_scale = 1.0 / (qp.qmax - qp.qmin)
+        self.p_zp = qp.qmin
+        self.p_qmin, self.p_qmax = qp.qmin, qp.qmax
+        self.q_mult, self.shift = quantize_multiplier(
+            self.p_scale * qp.scale / out.scale
+        )
+
+    def _split_heads(self, x):
+        heads, hd = self.node.attr("num_heads"), self.node.attr("head_dim")
+        b, t = x.shape[:2]
+        return x.reshape(b, t, 3, heads, hd).transpose(2, 0, 3, 1, 4)
+
+    @staticmethod
+    def _softmax(logits):
+        e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        return e / e.sum(axis=-1, keepdims=True)
+
+    def quantized_infer(self, inputs):
+        self._check_ready()
+        x = self._fq_inputs(inputs)[0]
+        q, k, v = self._split_heads(x)
+        logits = np.matmul(q, k.transpose(0, 1, 3, 2)).astype(np.float64)
+        probs = fake_quantize(
+            self._softmax(logits),
+            self.p_scale,
+            self.p_zp,
+            self.p_qmin,
+            self.p_qmax,
+        )
+        o = np.matmul(probs.astype(np.float32), v)
+        b, t = x.shape[:2]
+        o = o.transpose(0, 2, 1, 3).reshape(b, t, -1)
+        return self._fq_outputs([o])
+
+    def quantized_infer_integer(self, inputs):
+        self._check_ready()
+        qp, out = self.in_qp[0], self.out_qp[0]
+        x = np.asarray(inputs[0])
+        b, t = x.shape[:2]
+        q, k, v = self._split_heads((x - qp.zp).astype(np.int32))
+        heads, hd = q.shape[1], q.shape[3]
+        wide_qk = native.accumulator_is_wide(self.num_bits, hd)
+        wide_pv = native.accumulator_is_wide(self.num_bits, t)
+        acc_dtype = np.int64 if wide_pv else np.int32
+        o_acc = np.empty((b, heads, t, hd), dtype=acc_dtype)
+        for i in range(b):
+            for h in range(heads):
+                logits = native.gemm_int(
+                    q[i, h], np.ascontiguousarray(k[i, h].T), wide_qk
+                ).astype(np.float64) * (qp.scale * qp.scale)
+                p = self._softmax(logits)
+                p_int = np.clip(
+                    np.round(p / self.p_scale) + self.p_zp,
+                    self.p_qmin,
+                    self.p_qmax,
+                ).astype(np.int32)
+                o_acc[i, h] = native.gemm_int(
+                    p_int - self.p_zp, v[i, h], wide_pv
+                )
+        merged = np.ascontiguousarray(o_acc.transpose(0, 2, 1, 3))
+        res = native.requantize(
+            merged.reshape(1, 1, -1),
+            1,
+            1,
+            merged.size,
+            self.q_mult,
+            self.shift,
+            out.zp,
+            out.qmin,
+            out.qmax,
+        )
+        return [res.reshape(b, t, heads * hd)]
+
+
 class BatchNormalizationQuantize(BaseQuantLayer):
     """Inference-mode BatchNorm as a per-channel integer affine transform."""
 
@@ -674,6 +764,8 @@ def map_node_to_quant(node, graph, quant_type="int8", per_channel=True):
             ok = ok and const(node.inputs[2])
         if ok and not const(node.inputs[0]):
             return GemmQuantize(*args)
+    if op == "MultiHeadAttention" and not const(node.inputs[0]):
+        return MultiHeadAttentionQuantize(*args)
     if op == "BatchNormalization" and all(const(i) for i in node.inputs[1:5]):
         return BatchNormalizationQuantize(*args)
     if ActivationQuantize.supports(node, graph, quant_type):

@@ -72,7 +72,13 @@ static inference with 32/64-bit integer accumulation.
      Exact algebraic folds: `Conv + BatchNorm` -> `Conv`, LayerNorm
      gain/shift into the following linear layers, the attention `1/sqrt(d)`
      scale into the query weights, and `Gather(LayerNorm(x))` ->
-     `LayerNorm(Gather(x))`. Tidy-ups: no-op `Cast` removal, fused
+     `LayerNorm(Gather(x))`. The 12-node attention core becomes one
+     `MultiHeadAttention` node with a dedicated quantized layer: `q k^T` and
+     `p v` are integer matrix products, the softmax runs in float and its
+     output is quantized on a fixed `[0, 1]` grid (no calibration). On a real
+     ViT-Ti/16 this takes the quantized graph from 272 to 128 layers and the
+     integer pass from ~1.2 s to ~0.17 s per image at unchanged int16
+     accuracy (cosine 0.9998). Tidy-ups: no-op `Cast` removal, fused
      element-wise subgraphs that are a known activation are renamed
      (`Gelu`, `Silu`, `Mish`, `HardSwish`, ...), chains of constant
      `Mul`/`Add` are merged, a constant `Mul` after a `Conv`/`MatMul`/`Gemm`
@@ -152,9 +158,15 @@ uv run python optimize_onnx.py vit_tiny.onnx -o vit_tiny_opt.onnx --check
 ```
 The result is a standard ONNX model (opset >= 20 when `Gelu` appears) that
 runs in any runtime. `MatMul + bias` is one `LinearLayer` node (an ONNX local
-function in domain `quantanything`, inlined by runtimes; `--expand-linear`
+function in domain `quantanything`, inlined by runtimes; `--no-functions`
 writes plain `MatMul` + `Add`); `--check` compares it with the original on ONNX Runtime.
-On a timm `vit_tiny_patch16_224` export: 483 -> 259 nodes.
+On a timm `vit_tiny_patch16_224` export: 483 -> 127 nodes (12 x
+`MultiHeadAttention`, 48 x `LinearLayer`, 25 x `LayerNormalization`, 12 x
+`Gelu`, 25 x `Add`, plus the patch-embedding Conv / Reshape / Transpose /
+Concat and the final Gather); the output differs from the original by 1.4e-5.
+`MultiHeadAttention` (the 12-node reshape / split / q k^T / softmax / p v /
+merge chain) is also an ONNX local function; `--no-functions` writes the
+standard operators instead (307 nodes at opset 20).
 
 ### Getting a real ViT without PyTorch
 

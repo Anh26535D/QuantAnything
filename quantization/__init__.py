@@ -13,6 +13,7 @@ from quantization.quant_layers import (
     GemmQuantize,
     GlobalAveragePoolQuantize,
     MulQuantize,
+    MultiHeadAttentionQuantize,
     ShapingQuantize,
     map_node_to_quant,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "ActivationQuantize",
     "AddQuantize",
     "MulQuantize",
+    "MultiHeadAttentionQuantize",
     "ConcatQuantize",
     "GlobalAveragePoolQuantize",
     "ShapingQuantize",

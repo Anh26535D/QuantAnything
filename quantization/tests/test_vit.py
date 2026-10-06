@@ -117,12 +117,16 @@ def test_int8_runs_and_stays_correlated(model, data):
         assert _cosine(c.run_graph(data[3], mode), ref) > 0.8
 
 
-def test_activation_by_activation_matmul_uses_generic_layer(model):
+def test_attention_is_one_layer_and_only_norm_and_gather_stay_generic(model):
     c = QuantContainer(model)
-    generic = [l for l in c.layers if type(l).__name__ == "BaseQuantLayer"]
-    assert {"MatMul", "Softmax", "LayerNormalization"} <= {
-        l.node.op_type for l in generic
+    kinds = Counter(type(l).__name__ for l in c.layers)
+    assert kinds["MultiHeadAttentionQuantize"] == 2
+    generic = {
+        l.node.op_type
+        for l in c.layers
+        if type(l).__name__ == "BaseQuantLayer"
     }
+    assert generic == {"LayerNormalization", "Gather"}
 
 
 def test_backends_bit_exact_on_vit(model, data, monkeypatch):
