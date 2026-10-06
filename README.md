@@ -16,6 +16,7 @@ static inference with 32/64-bit integer accumulation.
 ├── quantization/                 # Core quantization package
 │   ├── __init__.py              # Public API
 │   ├── onnx_graph.py            # ONNX -> NumPy graph (constant folding, toposort)
+│   ├── graph_passes.py          # Pattern fusions (LayerNorm, GELU/SiLU LUT, MatMul+bias)
 │   ├── float_ops.py             # NumPy reference implementation of ONNX operators
 │   ├── quant_container.py       # Calibration + float / fake-quant / integer execution
 │   ├── quant_layers.py          # Quantized layers (Conv, Gemm, BN, LUT activations, ...)
@@ -60,8 +61,14 @@ static inference with 32/64-bit integer accumulation.
      (`Pad` pads with the zero point, `MaxPool` with `qmin`).
    - **Scale matching**: `Add`, `Sub`, `Mul`, `Concat` and `GlobalAveragePool`
      precompute multipliers that align the input scales with the output scale.
-   - **Anything else** (e.g. `Softmax`) falls back to
-     dequantize -> NumPy float op -> quantize.
+   - **Graph fusions** (`graph_passes.py`, on by default): PyTorch-style
+     decomposed LayerNorm becomes one `LayerNormalization`; element-wise
+     subgraphs with one dynamic input (SiLU, decomposed GELU, `x * s + t`)
+     become a single lookup table; `MatMul + Add(bias)` joins the integer
+     accumulator; static `Shape -> Gather -> Expand` chains are folded.
+   - **Anything else** (e.g. `Softmax`, `LayerNormalization`, activation x
+     activation `MatMul`) falls back to dequantize -> NumPy float op ->
+     quantize, so those layers are *simulated*, not integer-only.
 4. **Persistence**: `container.save("q.json")` stores the per-tensor
    scales / zero points; `QuantContainer.load(onnx_model, "q.json")` rebuilds a
    calibrated container with bit-identical results.
@@ -105,8 +112,20 @@ Supported ONNX operators: `Conv` (2-D, grouped/depthwise), `Gemm`, `MatMul`,
 `Reshape`, `Flatten`, `Squeeze`, `Unsqueeze`, `Transpose`, `Pad`,
 `MaxPool`, `AveragePool`, `GlobalAveragePool`, `GlobalMaxPool`, `ReduceMean`,
 `Sigmoid`, `Relu`, `LeakyRelu`, `Tanh`, `HardSigmoid`, `HardSwish`, `Elu`,
-`Clip`, `Softmax`, `LogSoftmax`, `Cast`, `Shape`, `Gather`, ... Unsupported
+`Clip`, `Erf`, `Gelu`, `Pow`, `Expand`, `LayerNormalization`, `Softmax`,
+`LogSoftmax`, `Cast`, `Shape`, `Gather`, ... Unsupported
 operators raise a descriptive `UnsupportedOp` error.
+
+---
+
+### Vision Transformers
+
+`tests/test_vit.py` pushes a small ViT (patch-embed Conv, cls token, MHSA with
+activation x activation `MatMul`, GELU MLP, LayerNorm) through the pipeline.
+Float parity with `onnxruntime` is ~1e-6. On a random-weight 4-block ViT
+(dim 64) logit cosine similarity vs float was ~0.99998 for **int16** but only
+~0.92 for **int8** (naive per-tensor min/max): the residual stream has
+outliers. Outlier-aware calibration (Phase 2) is the next lever.
 
 ---
 

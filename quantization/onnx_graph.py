@@ -58,6 +58,27 @@ def _attr_value(attribute):
     return value
 
 
+def _static_shapes(model):
+    """``{tensor: shape}`` for every tensor whose shape is fully static."""
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+    except Exception:  # shape inference is best effort
+        inferred = model
+    shapes = {}
+    g = inferred.graph
+    for vi in list(g.input) + list(g.value_info) + list(g.output):
+        tt = vi.type.tensor_type
+        if not tt.HasField("shape"):
+            continue
+        dims = [
+            d.dim_value if d.HasField("dim_value") else None
+            for d in tt.shape.dim
+        ]
+        if all(d is not None for d in dims):
+            shapes[vi.name] = dims
+    return shapes
+
+
 class OnnxGraph:
     """A topologically sorted ONNX graph with constants resolved to NumPy.
 
@@ -74,6 +95,8 @@ class OnnxGraph:
         self.inputs = list(inputs)
         self.outputs = list(outputs)
         self.opset = opset
+        self._static_shapes = {}
+        self.fusions = {}
         self._index()
 
     def _index(self):
@@ -88,8 +111,12 @@ class OnnxGraph:
 
     # ----------------------------------------------------------- loading ----
     @classmethod
-    def from_model(cls, model):
-        """Builds a graph from a ``ModelProto`` or an ``.onnx`` file path."""
+    def from_model(cls, model, optimize=True):
+        """Builds a graph from a ``ModelProto`` or an ``.onnx`` file path.
+
+        ``optimize`` applies the pattern fusions of
+        :mod:`quantization.graph_passes`.
+        """
         if isinstance(model, OnnxGraph):
             return model
         if isinstance(model, (str, Path)):
@@ -135,9 +162,15 @@ class OnnxGraph:
         outputs = [o.name for o in graph.output]
 
         g = cls(nodes, initializers, inputs, outputs, opset)
+        g._static_shapes = _static_shapes(model)
         g._fold_constants()
         g._remove_identities()
         g._toposort()
+        if optimize:
+            from quantization import graph_passes  # avoids an import cycle
+
+            g.fusions = graph_passes.run_passes(g)
+            g._toposort()
         return g
 
     # ------------------------------------------------------ graph passes ----
@@ -148,7 +181,19 @@ class OnnxGraph:
         known = set(self.initializers)
         remaining = []
         for node in self.nodes:
-            if node.op_type == "Constant":
+            if (
+                node.op_type == "Shape"
+                and node.inputs[0] in self._static_shapes
+            ):
+                # Fully static input shape: the result is a constant.
+                shape = np.array(
+                    self._static_shapes[node.inputs[0]], dtype=np.int64
+                )
+                self.initializers[node.outputs[0]] = shape[
+                    node.attr("start", 0) : node.attr("end", None)
+                ]
+                known.add(node.outputs[0])
+            elif node.op_type == "Constant":
                 self.initializers[node.outputs[0]] = float_ops.constant_value(
                     node
                 )
