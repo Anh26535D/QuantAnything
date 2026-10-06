@@ -130,6 +130,18 @@ Float parity with `onnxruntime` is ~1e-6. On a random-weight 4-block ViT
 ~0.92 for **int8** (naive per-tensor min/max): the residual stream has
 outliers. Outlier-aware calibration (Phase 2) is the next lever.
 
+### Getting a real ViT without PyTorch
+
+`vit_from_npz.py` downloads Google's official ImageNet-21k -> 1k ViT checkpoints
+(`ti16`, `s16`, `b16`, from Google Cloud Storage) and writes a static-batch
+ONNX (`LayerNormalization` + `Gelu`, opset 20). It needs neither PyTorch,
+timm nor Hugging Face. `ti16` classifies the PyTorch-hub dog photo as
+*Samoyed* (0.803, identical to ONNX Runtime; max logit diff 1.6e-5).
+On that real model **int16 keeps the exact top-3 (cos 0.9997) while naive
+min/max int8 collapses (cos 0.13)**: the late residual stream has massive
+activations (abs-max ~570 vs 99.9th percentile ~15), so one int8 step is
+~4.5. Mixed precision or outlier-aware calibration is needed for int8 ViTs.
+
 ### Zero-shot ReID benchmark
 
 `reid_zero_shot.py` uses the embedding of a pretrained (not ReID-trained)
@@ -139,9 +151,8 @@ Rank-1/5/10 for the float model (ONNX Runtime) and for each quantization
 setting, plus the feature cosine similarity to float.
 
 ```bash
-uv run python download_vit.py --source timm --model vit_tiny_patch16_224 \
-    --embedding --output vit_tiny.onnx
-uv run python reid_zero_shot.py --onnx vit_tiny.onnx \
+uv run python vit_from_npz.py --variant ti16 --embedding --output vit_ti16_emb.onnx
+uv run python reid_zero_shot.py --onnx vit_ti16_emb.onnx \
     --root Market-1501-v15.09.15 --max-ids 100 --distractors 1000 \
     --quant-types int8 int16 --modes integer
 ```
