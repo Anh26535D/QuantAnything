@@ -25,8 +25,11 @@ static inference with 32/64-bit integer accumulation.
 │   ├── kernels/
 │   │   ├── qa_kernels.cpp       # C++ kernels (GEMM, conv, requantize, ...)
 │   │   └── CMakeLists.txt       # Optional ahead-of-time build
+│   ├── reid.py                  # ReID dataset parsing, embeddings, mAP / CMC
 │   ├── evaluator.py             # Calibration and classification evaluation pipeline
 │   └── tests/                   # pytest suite (kernels, ops vs onnxruntime, layers, e2e)
+├── download_vit.py               # Get a static-batch ViT ONNX (HF download or timm export)
+├── reid_zero_shot.py             # Zero-shot ReID benchmark: float vs quantized backbone
 ├── download_and_convert.py       # Export YOLOv8n-cls to ONNX (needs `ultralytics`)
 ├── quantization_test.ipynb       # Interactive validation notebook
 ├── quantization_architecture.md  # Detailed technical architecture design
@@ -126,6 +129,27 @@ Float parity with `onnxruntime` is ~1e-6. On a random-weight 4-block ViT
 (dim 64) logit cosine similarity vs float was ~0.99998 for **int16** but only
 ~0.92 for **int8** (naive per-tensor min/max): the residual stream has
 outliers. Outlier-aware calibration (Phase 2) is the next lever.
+
+### Zero-shot ReID benchmark
+
+`reid_zero_shot.py` uses the embedding of a pretrained (not ReID-trained)
+backbone with cosine distance on a Market-1501 style dataset (`query/` and
+`bounding_box_test/`, files `<pid>_c<cam>s<seq>_*.jpg`) and reports mAP /
+Rank-1/5/10 for the float model (ONNX Runtime) and for each quantization
+setting, plus the feature cosine similarity to float.
+
+```bash
+uv run python download_vit.py --source timm --model vit_tiny_patch16_224 \
+    --embedding --output vit_tiny.onnx
+uv run python reid_zero_shot.py --onnx vit_tiny.onnx \
+    --root Market-1501-v15.09.15 --max-ids 100 --distractors 1000 \
+    --quant-types int8 int16 --modes integer
+```
+
+A classification ONNX also works (the head is cut automatically). The
+simulator is slow on the full ~19.7k-image gallery, so subsample with
+`--max-ids` / `--distractors` first. Use `--norm` to match the checkpoint
+(`half`, `imagenet`, `clip`).
 
 ---
 

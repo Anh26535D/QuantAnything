@@ -61,12 +61,17 @@ def download_hf(repo_id, filename):
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
-def export_timm(model_name, imgsz, batch, path, opset=17):
-    """Exports a pretrained timm model to a static-shape ONNX file."""
+def export_timm(model_name, imgsz, batch, path, opset=17, embedding=False):
+    """Exports a pretrained timm model to a static-shape ONNX file.
+
+    With ``embedding`` the classifier is dropped (``num_classes=0``) so the
+    output is the feature vector, e.g. for ReID.
+    """
     import timm
     import torch
 
-    model = timm.create_model(model_name, pretrained=True).eval()
+    kwargs = {"num_classes": 0} if embedding else {}
+    model = timm.create_model(model_name, pretrained=True, **kwargs).eval()
     dummy = torch.randn(batch, 3, imgsz, imgsz)
     torch.onnx.export(
         model,
@@ -74,7 +79,7 @@ def export_timm(model_name, imgsz, batch, path, opset=17):
         path,
         opset_version=opset,
         input_names=["images"],
-        output_names=["logits"],
+        output_names=["features" if embedding else "logits"],
         do_constant_folding=True,
         dynamo=False,
     )
@@ -104,6 +109,11 @@ def main(argv=None):
     )
     parser.add_argument("--imgsz", type=int, default=224)
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument(
+        "--embedding",
+        action="store_true",
+        help="drop the classifier, output features (--source timm; for ReID)",
+    )
     parser.add_argument("--output", default="vit.onnx")
     args = parser.parse_args(argv)
 
@@ -114,7 +124,13 @@ def main(argv=None):
         onnx.save(model, args.output)
     else:
         print(f"Exporting timm model {args.model} ...")
-        export_timm(args.model, args.imgsz, args.batch, args.output)
+        export_timm(
+            args.model,
+            args.imgsz,
+            args.batch,
+            args.output,
+            embedding=args.embedding,
+        )
     print(f"Saved {args.output}")
 
     from quantization import OnnxGraph
