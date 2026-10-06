@@ -58,7 +58,9 @@ def test_pytorch_style_decomposition_is_fused():
         build_vit(depth=2, ln_style="op", gelu_style="op")
     )
     # 2 blocks -> 5 LayerNorms, 2 GELUs, 8 MatMul+bias pairs (qkv, proj, mlp)
-    assert dec.fusions == {"matmul_bias": 8, "layernorm": 5, "elementwise": 2}
+    assert dec.fusions["matmul_bias"] == 8
+    assert dec.fusions["layernorm"] == 5
+    assert dec.fusions["elementwise"] == 2
     ops = Counter(n.op_type for n in dec.nodes)
     assert ops["LayerNormalization"] == 5
     assert ops["FusedElementwise"] == 2

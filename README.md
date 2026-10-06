@@ -69,6 +69,11 @@ static inference with 32/64-bit integer accumulation.
      subgraphs with one dynamic input (SiLU, decomposed GELU, `x * s + t`)
      become a single lookup table; `MatMul + Add(bias)` joins the integer
      accumulator; static `Shape -> Gather -> Expand` chains are folded.
+     Exact algebraic folds: `Conv + BatchNorm` -> `Conv`, LayerNorm
+     gain/shift into the following linear layers, the attention `1/sqrt(d)`
+     scale into the query weights, and `Gather(LayerNorm(x))` ->
+     `LayerNorm(Gather(x))`. They keep the float function (checked against
+     ONNX Runtime) but are **not** enough for int8 ViTs, see below.
    - **Anything else** (e.g. `Softmax`, `LayerNormalization`, activation x
      activation `MatMul`) falls back to dequantize -> NumPy float op ->
      quantize, so those layers are *simulated*, not integer-only.
@@ -141,6 +146,13 @@ On that real model **int16 keeps the exact top-3 (cos 0.9997) while naive
 min/max int8 collapses (cos 0.13)**: the late residual stream has massive
 activations (abs-max ~570 vs 99.9th percentile ~15), so one int8 step is
 ~4.5. Mixed precision or outlier-aware calibration is needed for int8 ViTs.
+
+Measured on that model (fake-quant, int8 weights, cosine of the logits vs
+float; graph folds applied): everything int8 **0.17**; residual `Add` outputs
+int16 **0.65**; + LayerNorm int16 **0.63**; + all `MatMul` outputs int16
+**0.92**; all non-Gemm activations int16 (i.e. W8A16) **0.9976**. The loss is
+spread over the residual stream, the linear / attention outputs and
+softmax / GELU, so W8A16 is the realistic target, not per-tensor A8.
 
 ### Zero-shot ReID benchmark
 
