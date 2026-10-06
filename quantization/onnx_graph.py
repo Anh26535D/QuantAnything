@@ -58,6 +58,21 @@ def _attr_value(attribute):
     return value
 
 
+def _inferred_dtypes(model):
+    """``{tensor: numpy dtype}`` from (inferred) ONNX type information."""
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+    except Exception:  # best effort
+        inferred = model
+    g = inferred.graph
+    dtypes = {}
+    for vi in list(g.input) + list(g.value_info) + list(g.output):
+        et = vi.type.tensor_type.elem_type
+        if et:
+            dtypes[vi.name] = helper.tensor_dtype_to_np_dtype(et)
+    return dtypes
+
+
 def _static_shapes(model):
     """``{tensor: shape}`` for every tensor whose shape is fully static."""
     try:
@@ -96,6 +111,7 @@ class OnnxGraph:
         self.outputs = list(outputs)
         self.opset = opset
         self._static_shapes = {}
+        self._dtypes = {}
         self.fusions = {}
         self._index()
 
@@ -163,6 +179,7 @@ class OnnxGraph:
 
         g = cls(nodes, initializers, inputs, outputs, opset)
         g._static_shapes = _static_shapes(model)
+        g._dtypes = _inferred_dtypes(model)
         g._fold_constants()
         g._remove_identities()
         g._toposort()

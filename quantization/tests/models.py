@@ -168,6 +168,7 @@ def build_vit(
     batch=1,
     ln_style="decomposed",
     gelu_style="decomposed",
+    qk_scale="logits",
 ):
     """A small Vision Transformer with the structure of ``timm`` exports.
 
@@ -176,6 +177,8 @@ def build_vit(
     GELU MLP), final LayerNorm and a linear head on the cls token. The cls
     token is expanded with a ``Shape -> Gather -> Unsqueeze -> Concat`` chain
     like PyTorch exports do (folded because the batch size is static).
+    ``qk_scale`` is ``"logits"`` (scale the attention logits) or
+    ``"separate"`` (scale ``q`` and ``k^T``, as timm exports do).
     """
     b = ModelBuilder(seed, opset=17 if "op" in (ln_style, gelu_style) else 13)
     if gelu_style == "op":
@@ -216,8 +219,14 @@ def build_vit(
             b.op("Squeeze", [t, b.const(np.array([0], np.int64))])
             for t in b.op("Split", [qkv], n_out=3, axis=0, **split_attrs)
         ]
-        att = b.op("MatMul", [q, b.op("Transpose", [k], perm=[0, 1, 3, 2])])
-        att = b.op("Mul", [att, b.const(np.float32(hd**-0.5))])
+        kt = b.op("Transpose", [k], perm=[0, 1, 3, 2])
+        if qk_scale == "separate":  # timm: q and k^T each get hd**-0.25
+            s4 = b.const(np.float32(hd**-0.25))
+            q, kt = b.op("Mul", [q, s4]), b.op("Mul", [kt, s4])
+            att = b.op("MatMul", [q, kt])
+        else:  # original ViT: the scale is applied to the logits
+            att = b.op("MatMul", [q, kt])
+            att = b.op("Mul", [att, b.const(np.float32(hd**-0.5))])
         att = b.op("Softmax", [att], axis=-1)
         o = b.op("Transpose", [b.op("MatMul", [att, v])], perm=[0, 2, 1, 3])
         o = b.op(

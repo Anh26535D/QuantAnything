@@ -3,6 +3,8 @@
 All passes are conservative: they only fire on an exact structural match and
 leave the graph untouched otherwise.
 
+* :func:`remove_noop_cast`, :func:`canonicalize_activations`,
+  :func:`merge_constant_ops`, :func:`fold_mul_into_linear`: tidy-ups,
 * :func:`fold_conv_bn`: ``Conv -> BatchNormalization`` -> ``Conv``,
 * :func:`fuse_matmul_bias`: ``MatMul(x, W) + b`` -> ``MatMul(x, W, b)``
   (internal 3-input form, so the bias joins the accumulator),
@@ -289,98 +291,131 @@ def _new_const(graph, base, value):
     return name
 
 
-def fold_attention_scale(graph):
-    """Folds ``softmax(q k^T * s)`` scaling into the query weights.
+def _trace_qkv(graph, cons, prod, tensor):
+    """Walks back from a q / k tensor to the fused QKV projection.
 
-    Matches ``Mul(MatMul(q, k^T), s)`` where ``q`` comes from a fused QKV
-    projection (``MatMul(+bias) -> Reshape [B,T,3,H,hd] -> Transpose
-    [2,0,3,1,4] -> Split(axis 0) -> Squeeze``). The query columns of the
-    projection are multiplied by the scalar ``s`` and the ``Mul`` is removed:
-    one lossy quantization point less, and smaller attention logits.
+    Accepts ``[Transpose(0,1,3,2)] <- Squeeze <- Split <- Transpose(2,0,3,1,4)
+    <- Reshape [B,T,3,H,hd] <- MatMul(x, W, b)`` and returns
+    ``(matmul node, slot, head width)`` (slot 0/1/2 = q/k/v) or ``None``.
+    Every tensor on the way must have a single consumer.
+    """
+    init = graph.initializers
+
+    def single(t):
+        return len(cons[t]) == 1 and t not in graph.outputs
+
+    node = prod.get(tensor)
+    if (
+        node
+        and node.op_type == "Transpose"
+        and list(node.attr("perm", [])) == [0, 1, 3, 2]
+    ):
+        if not single(node.inputs[0]):
+            return None
+        tensor = node.inputs[0]
+        node = prod.get(tensor)
+    if not (node and node.op_type == "Squeeze" and single(node.inputs[0])):
+        return None
+    sp = prod.get(node.inputs[0])
+    if not (sp and sp.op_type == "Split" and len(sp.outputs) == 3):
+        return None
+    slot = sp.outputs.index(node.inputs[0])
+    if not all(single(o) for o in sp.outputs):
+        return None
+    tr = prod.get(sp.inputs[0])
+    if not (
+        tr
+        and tr.op_type == "Transpose"
+        and list(tr.attr("perm", [])) == [2, 0, 3, 1, 4]
+        and single(tr.outputs[0])
+    ):
+        return None
+    rs = prod.get(tr.inputs[0])
+    if not (
+        rs
+        and rs.op_type == "Reshape"
+        and rs.inputs[1] in init
+        and single(rs.outputs[0])
+    ):
+        return None
+    shape = init[rs.inputs[1]].reshape(-1)
+    mm = prod.get(rs.inputs[0])
+    if not (
+        shape.size == 5
+        and shape[2] == 3
+        and mm
+        and mm.op_type == "MatMul"
+        and len(mm.inputs) == 3
+        and single(mm.outputs[0])
+    ):
+        return None
+    w, b = init.get(mm.inputs[1]), init.get(mm.inputs[2])
+    width = int(shape[3] * shape[4])
+    if w is None or b is None or w.ndim != 2 or w.shape[1] != 3 * width:
+        return None
+    return mm, slot, width
+
+
+def fold_attention_scale(graph):
+    """Folds constant attention scalings into the QKV projection weights.
+
+    Handles both exports of ``softmax(q k^T / sqrt(d))``:
+
+    * a scalar ``Mul`` on the logits ``MatMul(q, k^T)`` (original ViT),
+    * scalar ``Mul`` nodes on ``q`` and / or ``k^T`` themselves (timm).
+
+    The matching columns of the fused ``MatMul`` weight and bias are multiplied
+    by the scalar and the ``Mul`` disappears: fewer lossy quantization points
+    and no per-head constant multiplications.
     """
     cons = _consumers(graph)
     prod = {o: n for n in graph.nodes for o in n.outputs}
     init = graph.initializers
     alias, removed = {}, set()
+    # per projection: accumulated column scaling [q, k, v]
+    scales = {}
 
-    def only(tensor, node):
-        users = cons[tensor]
-        return (
-            len(users) == 1
-            and users[0] is node
-            and tensor not in graph.outputs
-        )
+    def single(t):
+        return len(cons[t]) == 1 and t not in graph.outputs
 
     for mul in graph.nodes:
         if mul.op_type != "Mul" or len(mul.inputs) != 2:
             continue
-        att, scale = mul.inputs
+        data, scale = mul.inputs
         if scale not in init or init[scale].size != 1:
-            att, scale = scale, att
-        if scale not in init or init[scale].size != 1 or att in init:
+            data, scale = scale, data
+        if scale not in init or init[scale].size != 1 or data in init:
             continue
-        a = prod.get(att)
-        if not (
-            a
-            and a.op_type == "MatMul"
-            and len(a.inputs) == 2
-            and only(att, mul)
-        ):
+        if not single(data):
             continue
-        sq = prod.get(a.inputs[0])
-        if not (sq and sq.op_type == "Squeeze" and only(sq.outputs[0], a)):
+        target = data
+        a = prod.get(data)
+        if a and a.op_type == "MatMul" and len(a.inputs) == 2:
+            target = a.inputs[0]  # scale on the logits -> into q
+            if not single(target):
+                continue
+        traced = _trace_qkv(graph, cons, prod, target)
+        if traced is None:
             continue
-        sp = prod.get(sq.inputs[0])
-        if not (
-            sp
-            and sp.op_type == "Split"
-            and len(sp.outputs) == 3
-            and sp.outputs[0] == sq.inputs[0]
-            and only(sp.outputs[0], sq)
-        ):
-            continue
-        tr = prod.get(sp.inputs[0])
-        if not (
-            tr
-            and tr.op_type == "Transpose"
-            and list(tr.attr("perm", [])) == [2, 0, 3, 1, 4]
-            and only(tr.outputs[0], sp)
-        ):
-            continue
-        rs = prod.get(tr.inputs[0])
-        if not (
-            rs
-            and rs.op_type == "Reshape"
-            and rs.inputs[1] in init
-            and only(rs.outputs[0], tr)
-        ):
-            continue
-        shape = init[rs.inputs[1]].reshape(-1)
-        mm = prod.get(rs.inputs[0])
-        if not (
-            shape.size == 5
-            and shape[2] == 3
-            and mm
-            and mm.op_type == "MatMul"
-            and len(mm.inputs) == 3
-            and only(mm.outputs[0], rs)
-        ):
-            continue
-        w, b = init.get(mm.inputs[1]), init.get(mm.inputs[2])
-        width = int(shape[3] * shape[4])
-        if w is None or b is None or w.ndim != 2 or w.shape[1] != 3 * width:
-            continue
+        mm, slot, width = traced
         s = float(init[scale].reshape(()))
-        w2, b2 = w.copy(), b.reshape(-1).copy()
-        w2[:, :width] *= np.float32(s)
-        b2[:width] *= np.float32(s)
+        entry = scales.setdefault(id(mm), (mm, width, [1.0, 1.0, 1.0]))
+        entry[2][slot] *= s
+        alias[mul.outputs[0]] = data
+        removed.add(id(mul))
+    for mm, width, factors in scales.values():
+        w = init[mm.inputs[1]].copy()
+        b = init[mm.inputs[2]].reshape(-1).copy()
+        for slot, f in enumerate(factors):
+            if f != 1.0:
+                sl = slice(slot * width, (slot + 1) * width)
+                w[:, sl] *= np.float32(f)
+                b[sl] *= np.float32(f)
         mm.inputs = [
             mm.inputs[0],
-            _new_const(graph, mm.inputs[1] + "_qscaled", w2),
-            _new_const(graph, mm.inputs[2] + "_qscaled", b2),
+            _new_const(graph, mm.inputs[1] + "_qkscaled", w),
+            _new_const(graph, mm.inputs[2] + "_qkscaled", b),
         ]
-        alias[mul.outputs[0]] = att
-        removed.add(id(mul))
     if removed:
         graph.nodes = [n for n in graph.nodes if id(n) not in removed]
         _rewire(graph, alias)
@@ -556,13 +591,230 @@ def fold_conv_bn(graph):
     return len(replace)
 
 
+# ----------------------------------------- canonical activations / casts ----
+def canonicalize_activations(graph):
+    """Names fused element-wise subgraphs that are a known activation.
+
+    The fused function is probed numerically on a grid and compared with
+    ``Gelu`` (exact / tanh), ``Silu``, ``Mish``, ``HardSwish``, ``Sigmoid``,
+    ``Tanh`` ...; a match replaces the anonymous ``FusedElementwise`` by the
+    named operator (cheaper to evaluate, readable, same lookup table).
+    """
+    from quantization import float_ops
+
+    grid = np.concatenate(
+        [np.linspace(-12, 12, 4801), np.linspace(-80, 80, 321)]
+    ).astype(np.float32)
+    catalog = [
+        ("Gelu", {"approximate": "none"}),
+        ("Gelu", {"approximate": "tanh"}),
+        ("Silu", {}),
+        ("Mish", {}),
+        ("HardSwish", {}),
+        ("Sigmoid", {}),
+        ("Tanh", {}),
+        ("Relu", {}),
+        ("Softplus", {}),
+    ]
+    probes = {}
+    for op, attrs in catalog:
+        probe = Node("probe", op, ["x"], ["y"], attrs)
+        probes[(op, tuple(attrs.items()))] = float_ops.run_node(probe, [grid])[
+            0
+        ].astype(np.float64)
+
+    n_named = 0
+    for idx, node in enumerate(graph.nodes):
+        if node.op_type != "FusedElementwise":
+            continue
+        y = float_ops.run_node(node, [grid])[0].astype(np.float64)
+        tol = 2e-5 * np.maximum(1.0, np.abs(y))
+        for (op, attrs), ref in probes.items():
+            if np.all(np.abs(y - ref) <= tol):
+                graph.nodes[idx] = Node(
+                    node.name,
+                    op,
+                    list(node.inputs),
+                    list(node.outputs),
+                    dict(attrs),
+                )
+                n_named += 1
+                break
+    if n_named:
+        graph._index()
+    return n_named
+
+
+def remove_noop_cast(graph):
+    """Drops ``Cast`` nodes whose input already has the target type."""
+    from onnx import helper
+
+    dtypes = dict(getattr(graph, "_dtypes", {}))
+    dtypes.update({k: v.dtype for k, v in graph.initializers.items()})
+    alias, kept = {}, []
+    for node in graph.nodes:
+        node.inputs = [alias.get(i, i) for i in node.inputs]
+        if node.op_type == "Cast" and node.outputs[0] not in graph.outputs:
+            to = helper.tensor_dtype_to_np_dtype(node.attr("to"))
+            src = dtypes.get(node.inputs[0])
+            if src is not None and np.dtype(src) == np.dtype(to):
+                alias[node.outputs[0]] = node.inputs[0]
+                continue
+        for out in node.outputs:
+            if node.op_type == "Cast":
+                dtypes[out] = helper.tensor_dtype_to_np_dtype(node.attr("to"))
+        kept.append(node)
+    if alias:
+        graph.nodes = kept
+        _rewire(graph, alias)
+        graph._index()
+    return len(alias)
+
+
+# ----------------------------------------------- constant multiplications ----
+def _const_operand(graph, node):
+    """``(dynamic input, const array)`` of a binary node with one constant."""
+    a, b = node.inputs[:2]
+    init = graph.initializers
+    if b in init and a not in init:
+        return a, init[b]
+    if a in init and b not in init:
+        return b, init[a]
+    return None
+
+
+def merge_constant_ops(graph):
+    """Merges ``(x*a)*b`` and ``(x+a)+b``; drops ``x*1`` and ``x+0``."""
+    cons = _consumers(graph)
+    prod = {o: n for n in graph.nodes for o in n.outputs}
+    alias, removed = {}, set()
+    for node in graph.nodes:
+        if node.op_type not in ("Mul", "Add") or id(node) in removed:
+            continue
+        found = _const_operand(graph, node)
+        if found is None:
+            continue
+        x, c = found
+        neutral = 1.0 if node.op_type == "Mul" else 0.0
+        if (
+            c.size == 1
+            and float(c.reshape(())) == neutral
+            and node.outputs[0] not in graph.outputs
+        ):
+            alias[node.outputs[0]] = x
+            removed.add(id(node))
+            continue
+        inner = prod.get(x)
+        if not (
+            inner
+            and inner.op_type == node.op_type
+            and id(inner) not in removed
+            and len(cons[x]) == 1
+            and x not in graph.outputs
+        ):
+            continue
+        found_in = _const_operand(graph, inner)
+        if found_in is None:
+            continue
+        x0, c0 = found_in
+        merged = c0 * c if node.op_type == "Mul" else c0 + c
+        node.inputs = [
+            x0,
+            _new_const(
+                graph,
+                node.name + "_merged",
+                merged.astype(np.result_type(c0.dtype, c.dtype)),
+            ),
+        ]
+        removed.add(id(inner))
+    if removed:
+        graph.nodes = [n for n in graph.nodes if id(n) not in removed]
+        _rewire(graph, alias)
+        graph._index()
+    return len(removed)
+
+
+def fold_mul_into_linear(graph):
+    """``Mul(Conv/MatMul/Gemm(x, W, b), c)`` -> scaled ``W`` and ``b``.
+
+    ``c`` must be a scalar or vary only along the output channels.
+    """
+    cons = _consumers(graph)
+    prod = {o: n for n in graph.nodes for o in n.outputs}
+    init = graph.initializers
+    alias, removed = {}, set()
+    for mul in graph.nodes:
+        if mul.op_type != "Mul":
+            continue
+        found = _const_operand(graph, mul)
+        if found is None:
+            continue
+        y, c = found
+        lin = prod.get(y)
+        if not (
+            lin
+            and lin.op_type in ("Conv", "MatMul", "Gemm")
+            and len(cons[y]) == 1
+            and y not in graph.outputs
+            and id(lin) not in removed
+            and lin.inputs[1] in init
+            and all(i in init for i in lin.inputs[2:] if i)
+        ):
+            continue
+        w = init[lin.inputs[1]]
+        trans = lin.op_type == "Gemm" and lin.attr("transB", 0)
+        if lin.op_type == "Conv":
+            out_ch, axis = w.shape[0], 0
+            ok = c.size == 1 or c.shape in (
+                (out_ch,),
+                (out_ch, 1, 1),
+                (1, out_ch, 1, 1),
+            )
+        else:
+            if w.ndim != 2 or (
+                lin.op_type == "Gemm" and (lin.attr("transA", 0))
+            ):
+                continue
+            out_ch = w.shape[0] if trans else w.shape[1]
+            axis = 0 if trans else 1
+            ok = c.size == 1 or c.shape in ((out_ch,), (1, out_ch))
+        if not ok:
+            continue
+        vec = np.broadcast_to(c.reshape(-1), (out_ch,)).astype(np.float64)
+        shape = [1] * w.ndim
+        shape[axis] = -1
+        w2 = (w.astype(np.float64) * vec.reshape(shape)).astype(np.float32)
+        ins = [
+            lin.inputs[0],
+            _new_const(graph, lin.inputs[1] + "_mulfold", w2),
+        ]
+        if len(lin.inputs) > 2 and lin.inputs[2]:
+            b = init[lin.inputs[2]].astype(np.float64)
+            b2 = (np.broadcast_to(b.reshape(-1), (out_ch,)) * vec).astype(
+                np.float32
+            )
+            ins.append(_new_const(graph, lin.inputs[2] + "_mulfold", b2))
+        lin.inputs = ins
+        alias[mul.outputs[0]] = y
+        removed.add(id(mul))
+    if removed:
+        graph.nodes = [n for n in graph.nodes if id(n) not in removed]
+        _rewire(graph, alias)
+        graph._index()
+    return len(removed)
+
+
 def run_passes(graph):
     """Applies every rewrite; returns ``{pass name: matches}``."""
     return {
+        "cast": remove_noop_cast(graph),
         "conv_bn": fold_conv_bn(graph),
         "matmul_bias": fuse_matmul_bias(graph),
         "layernorm": fuse_layernorm(graph),
         "elementwise": fuse_elementwise(graph),
+        "activation": canonicalize_activations(graph),
+        "const_ops": merge_constant_ops(graph),
+        "mul_into_linear": fold_mul_into_linear(graph),
         "attention_scale": fold_attention_scale(graph),
         "hoist_gather": hoist_gather_before_layernorm(graph),
         "layernorm_affine": fold_layernorm_affine(graph),

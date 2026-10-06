@@ -253,6 +253,18 @@ def _hard_swish(node, x):
     return (x * np.clip(x / 6.0 + 0.5, 0, 1)).astype(np.float32)
 
 
+@unary("Silu")
+def _silu(node, x):
+    x64 = x.astype(np.float64)
+    return (x64 / (1.0 + np.exp(-x64))).astype(np.float32)
+
+
+@unary("Mish")
+def _mish(node, x):
+    x64 = x.astype(np.float64)
+    return (x64 * np.tanh(np.logaddexp(0, x64))).astype(np.float32)
+
+
 @unary("Elu")
 def _elu(node, x):
     a = node.attr("alpha", 1.0)

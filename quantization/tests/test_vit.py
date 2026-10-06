@@ -63,7 +63,7 @@ def test_pytorch_style_decomposition_is_fused():
     assert dec.fusions["elementwise"] == 2
     ops = Counter(n.op_type for n in dec.nodes)
     assert ops["LayerNormalization"] == 5
-    assert ops["FusedElementwise"] == 2
+    assert ops["Gelu"] == 2 and "FusedElementwise" not in ops
     assert not {"ReduceMean", "Pow", "Sqrt", "Div", "Erf"} & set(ops)
     # the decomposed export collapses to the same graph as the fused ops
     assert len(dec.nodes) == len(fused.nodes)

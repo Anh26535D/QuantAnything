@@ -72,7 +72,15 @@ static inference with 32/64-bit integer accumulation.
      Exact algebraic folds: `Conv + BatchNorm` -> `Conv`, LayerNorm
      gain/shift into the following linear layers, the attention `1/sqrt(d)`
      scale into the query weights, and `Gather(LayerNorm(x))` ->
-     `LayerNorm(Gather(x))`. They keep the float function (checked against
+     `LayerNorm(Gather(x))`. Tidy-ups: no-op `Cast` removal, fused
+     element-wise subgraphs that are a known activation are renamed
+     (`Gelu`, `Silu`, `Mish`, `HardSwish`, ...), chains of constant
+     `Mul`/`Add` are merged, a constant `Mul` after a `Conv`/`MatMul`/`Gemm`
+     is folded into its weights, and the attention scale is folded into the
+     QKV projection whether it sits on the logits or on `q` and `k^T`
+     separately (timm). On a timm `vit_tiny_patch16_224` export the graph
+     goes from 483 nodes to 259 (no `Cast`, `Shape`, `Sqrt`, `Div`, `Erf` or
+     `Mul` left, 12 named `Gelu`). They keep the float function (checked against
      ONNX Runtime) but are **not** enough for int8 ViTs, see below.
    - **Anything else** (e.g. `Softmax`, `LayerNormalization`, activation x
      activation `MatMul`) falls back to dequantize -> NumPy float op ->
