@@ -120,3 +120,120 @@ def build_yolo_like(seed=0, size=32, classes=10, width=8):
     )
     y = b.op("Softmax", [y], axis=1)
     return b.build(x, ["N", 3, size, size], y, ["N", classes])
+
+
+def _layer_norm(b, x, dim, style):
+    """LayerNorm over the last axis: fused op or PyTorch decomposition."""
+    gamma = b.const((1 + 0.1 * b.rng.standard_normal(dim)).astype(np.float32))
+    beta = b.const((0.1 * b.rng.standard_normal(dim)).astype(np.float32))
+    if style == "op":
+        return b.op(
+            "LayerNormalization", [x, gamma, beta], axis=-1, epsilon=1e-6
+        )
+    mean = b.op("ReduceMean", [x], axes=[-1], keepdims=1)
+    d = b.op("Sub", [x, mean])
+    var = b.op(
+        "ReduceMean",
+        [b.op("Pow", [d, b.const(np.float32(2.0))])],
+        axes=[-1],
+        keepdims=1,
+    )
+    std = b.op("Sqrt", [b.op("Add", [var, b.const(np.float32(1e-6))])])
+    return b.op("Add", [b.op("Mul", [b.op("Div", [d, std]), gamma]), beta])
+
+
+def _gelu(b, x, style):
+    if style == "op":
+        return b.op("Gelu", [x])
+    s2 = b.const(np.float32(np.sqrt(2.0)))
+    erf = b.op("Erf", [b.op("Div", [x, s2])])
+    one_plus = b.op("Add", [erf, b.const(np.float32(1.0))])
+    return b.op("Mul", [b.op("Mul", [x, b.const(np.float32(0.5))]), one_plus])
+
+
+def _linear(b, x, cin, cout, scale=0.15):
+    """3-D Linear as exported by PyTorch: MatMul + Add."""
+    y = b.op("MatMul", [x, b.weight(cin, cout, scale=scale)])
+    return b.op("Add", [y, b.weight(cout, scale=0.05, base="bias")])
+
+
+def build_vit(
+    seed=0,
+    img=32,
+    patch=8,
+    dim=32,
+    heads=4,
+    depth=2,
+    classes=10,
+    batch=1,
+    ln_style="decomposed",
+    gelu_style="decomposed",
+):
+    """A small Vision Transformer with the structure of ``timm`` exports.
+
+    Patch embedding (Conv), cls token + positional embedding, ``depth`` pre-LN
+    blocks (multi-head self-attention with activation x activation MatMuls,
+    GELU MLP), final LayerNorm and a linear head on the cls token. The cls
+    token is expanded with a ``Shape -> Gather -> Unsqueeze -> Concat`` chain
+    like PyTorch exports do (folded because the batch size is static).
+    """
+    b = ModelBuilder(seed, opset=17 if "op" in (ln_style, gelu_style) else 13)
+    if gelu_style == "op":
+        b.opset = 20
+    hd = dim // heads
+    tokens = (img // patch) ** 2 + 1
+
+    x = b.conv("images", 3, dim, patch, stride=patch, pad=0)
+    x = b.op("Reshape", [x, b.const(np.array([batch, dim, -1], np.int64))])
+    x = b.op("Transpose", [x], perm=[0, 2, 1])
+    cls = b.weight(1, 1, dim, scale=0.1, base="cls")
+    bsz = b.op(
+        "Gather",
+        [b.op("Shape", ["images"]), b.const(np.array(0, np.int64))],
+        axis=0,
+    )
+    shape = b.op(
+        "Concat",
+        [
+            b.op("Unsqueeze", [bsz, b.const(np.array([0], np.int64))]),
+            b.const(np.array([1, dim], np.int64)),
+        ],
+        axis=0,
+    )
+    x = b.op("Concat", [b.op("Expand", [cls, shape]), x], axis=1)
+    x = b.op("Add", [x, b.weight(1, tokens, dim, scale=0.1, base="pos")])
+
+    for _ in range(depth):
+        h = _layer_norm(b, x, dim, ln_style)
+        qkv = _linear(b, h, dim, 3 * dim)
+        qkv = b.op(
+            "Reshape",
+            [qkv, b.const(np.array([batch, tokens, 3, heads, hd], np.int64))],
+        )
+        qkv = b.op("Transpose", [qkv], perm=[2, 0, 3, 1, 4])
+        split_attrs = {"num_outputs": 3} if b.opset >= 18 else {}
+        q, k, v = [
+            b.op("Squeeze", [t, b.const(np.array([0], np.int64))])
+            for t in b.op("Split", [qkv], n_out=3, axis=0, **split_attrs)
+        ]
+        att = b.op("MatMul", [q, b.op("Transpose", [k], perm=[0, 1, 3, 2])])
+        att = b.op("Mul", [att, b.const(np.float32(hd**-0.5))])
+        att = b.op("Softmax", [att], axis=-1)
+        o = b.op("Transpose", [b.op("MatMul", [att, v])], perm=[0, 2, 1, 3])
+        o = b.op(
+            "Reshape", [o, b.const(np.array([batch, tokens, dim], np.int64))]
+        )
+        x = b.op("Add", [x, _linear(b, o, dim, dim)])
+
+        h = _layer_norm(b, x, dim, ln_style)
+        h = _gelu(b, _linear(b, h, dim, 4 * dim), gelu_style)
+        x = b.op("Add", [x, _linear(b, h, 4 * dim, dim)])
+
+    x = _layer_norm(b, x, dim, ln_style)
+    x = b.op("Gather", [x, b.const(np.array(0, np.int64))], axis=1)
+    y = b.op(
+        "Gemm",
+        [x, b.weight(classes, dim), b.weight(classes, scale=0.05)],
+        transB=1,
+    )
+    return b.build("images", [batch, 3, img, img], y, [batch, classes])

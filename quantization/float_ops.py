@@ -180,7 +180,21 @@ def _gemm(node, inputs, opset, **kw):
 
 @register("MatMul")
 def _matmul(node, inputs, opset, **kw):
-    return np.matmul(inputs[0], inputs[1]).astype(np.float32)
+    y = np.matmul(inputs[0], inputs[1]).astype(np.float32)
+    if len(inputs) > 2 and inputs[2] is not None:  # fused bias (internal)
+        y = y + inputs[2]
+    return y
+
+
+@register("FusedElementwise")
+def _fused(node, inputs, opset, **kw):
+    """Evaluates the element-wise subgraph collected by ``graph_passes``."""
+    env = dict(node.attrs["consts"])
+    env[node.inputs[0]] = inputs[0]
+    for sub in node.attrs["nodes"]:
+        args = [env[i] if i else None for i in sub.inputs]
+        env[sub.outputs[0]] = run_node(sub, args, opset)[0]
+    return env[node.outputs[0]]
 
 
 @register("BatchNormalization")
@@ -270,6 +284,67 @@ def _sqrt(node, x):
 @unary("Exp")
 def _exp(node, x):
     return np.exp(x.astype(np.float64)).astype(np.float32)
+
+
+def _erf(x):
+    """erf via Abramowitz-Stegun 7.1.26 refined by one Newton-free series
+    split: |error| < 1.5e-7, below float32 resolution of the activations."""
+    x = x.astype(np.float64)
+    sign = np.sign(x)
+    ax = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * ax)
+    poly = t * (
+        0.254829592
+        + t
+        * (
+            -0.284496736
+            + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))
+        )
+    )
+    return sign * (1.0 - poly * np.exp(-ax * ax))
+
+
+@unary("Erf")
+def _erf_op(node, x):
+    return _erf(x).astype(np.float32)
+
+
+@unary("Gelu")
+def _gelu(node, x):
+    x64 = x.astype(np.float64)
+    if node.attr("approximate", "none") == "tanh":
+        inner = np.sqrt(2 / np.pi) * (x64 + 0.044715 * x64**3)
+        return (0.5 * x64 * (1 + np.tanh(inner))).astype(np.float32)
+    return (0.5 * x64 * (1 + _erf(x64 / np.sqrt(2)))).astype(np.float32)
+
+
+@register("Pow")
+def _pow(node, inputs, opset, **kw):
+    return np.power(
+        inputs[0].astype(np.float64), np.asarray(inputs[1]).astype(np.float64)
+    ).astype(np.float32)
+
+
+@register("Expand")
+def _expand(node, inputs, opset, **kw):
+    shape = [int(v) for v in np.asarray(inputs[1]).reshape(-1)]
+    return np.broadcast_to(
+        inputs[0], np.broadcast_shapes(inputs[0].shape, tuple(shape))
+    ).copy()
+
+
+@register("LayerNormalization")
+def _layer_norm(node, inputs, opset, **kw):
+    x = inputs[0].astype(np.float64)
+    axis = _norm_axis(node.attr("axis", -1), x.ndim)
+    axes = tuple(range(axis, x.ndim))
+    mean = x.mean(axis=axes, keepdims=True)
+    var = ((x - mean) ** 2).mean(axis=axes, keepdims=True)
+    y = (x - mean) / np.sqrt(var + node.attr("epsilon", 1e-5))
+    y = y * inputs[1]
+    if len(inputs) > 2 and inputs[2] is not None:
+        y = y + inputs[2]
+    return y.astype(np.float32)
 
 
 @register("Clip")

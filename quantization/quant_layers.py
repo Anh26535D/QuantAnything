@@ -360,6 +360,9 @@ class GemmQuantize(_WeightedLayer):
                     np.float32
                 )
                 bias = bias * np.float32(node.attr("beta", 1.0))
+        elif len(node.inputs) > 2 and node.inputs[2]:  # fused MatMul bias
+            bias = self.graph.initializers[node.inputs[2]].astype(np.float32)
+            bias = np.ascontiguousarray(bias.reshape(-1))
         return np.ascontiguousarray(b), bias
 
     def _flatten(self, x):
@@ -453,7 +456,7 @@ class ActivationQuantize(BaseQuantLayer):
             return False
         if node.op_type == "Clip":
             return all(graph.is_constant(i) for i in node.inputs[1:] if i)
-        return node.op_type in UNARY_OPS
+        return node.op_type in UNARY_OPS or node.op_type == "FusedElementwise"
 
     def prepare(self):
         qp = self.in_qp[0]
@@ -667,7 +670,7 @@ def map_node_to_quant(node, graph, quant_type="int8", per_channel=True):
     ):
         b = graph.initializers[node.inputs[1]]
         ok = b.ndim == 2 and not (op == "Gemm" and node.attr("transA", 0))
-        if op == "Gemm" and len(node.inputs) > 2 and node.inputs[2]:
+        if len(node.inputs) > 2 and node.inputs[2]:
             ok = ok and const(node.inputs[2])
         if ok and not const(node.inputs[0]):
             return GemmQuantize(*args)

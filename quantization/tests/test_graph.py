@@ -321,7 +321,40 @@ def test_loads_from_path(tmp_path):
 
 
 def test_unsupported_operator_has_clear_error():
-    model = _single("Erf", X4.shape)
+    model = _single("Det", X4.shape)
     g = OnnxGraph.from_model(model)
-    with pytest.raises(float_ops.UnsupportedOp, match="Erf"):
+    with pytest.raises(float_ops.UnsupportedOp, match="Det"):
         float_ops.run_float(g, X4)
+
+
+def test_new_ops_match_onnxruntime():
+    x = np.random.default_rng(0).standard_normal((2, 5, 8)).astype(np.float32)
+    _check(_single("Erf", x.shape), x, atol=2e-7)
+    _check(_single("Gelu", x.shape, opset=20), x, atol=2e-6)
+    _check(
+        _single("Gelu", x.shape, opset=20, approximate="tanh"), x, atol=2e-6
+    )
+    _check(_single("Pow", x.shape, [np.float32(2.0)]), x)
+    _check(
+        _single("Expand", (1, 1, 8), [np.array([2, 3, 8], np.int64)]),
+        x[:1, :1],
+    )
+    b = ModelBuilder(0)
+    y = b.op(
+        "LayerNormalization",
+        ["x", b.weight(8, scale=1.0), b.weight(8, scale=0.1)],
+        axis=-1,
+        epsilon=1e-5,
+    )
+    graph = helper.make_graph(
+        b.nodes,
+        "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, x.shape)],
+        [helper.make_tensor_value_info(y, TensorProto.FLOAT, None)],
+        b.inits,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    _check(model, x, atol=1e-5)
