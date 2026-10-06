@@ -1,6 +1,6 @@
 """Post-training quantization of ONNX models with NumPy + C++ kernels."""
 
-from quantization import native
+from quantization import int_ops, native, pwl
 from quantization.onnx_graph import OnnxGraph
 from quantization.quant_container import QuantContainer
 from quantization.quant_layers import (
@@ -12,9 +12,11 @@ from quantization.quant_layers import (
     ConvQuantize,
     GemmQuantize,
     GlobalAveragePoolQuantize,
+    LayerNormQuantize,
     MulQuantize,
     MultiHeadAttentionQuantize,
     ShapingQuantize,
+    SoftmaxQuantize,
     map_node_to_quant,
 )
 from quantization.utils import (
@@ -30,6 +32,8 @@ from quantization.utils import (
 
 __all__ = [
     "native",
+    "pwl",
+    "int_ops",
     "OnnxGraph",
     "QuantContainer",
     "QParams",
@@ -44,6 +48,8 @@ __all__ = [
     "ConcatQuantize",
     "GlobalAveragePoolQuantize",
     "ShapingQuantize",
+    "SoftmaxQuantize",
+    "LayerNormQuantize",
     "map_node_to_quant",
     "calculate_scale_zp",
     "dequantize",

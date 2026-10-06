@@ -97,14 +97,21 @@ def test_linear_layers_use_integer_gemm_with_fused_bias(model):
     )
 
 
-def test_int16_is_nearly_lossless(model, data):
-    c = QuantContainer(model, "int16")
+@pytest.mark.parametrize("nonlinear,min_cos", [("lut", 0.999), ("pwl", 0.995)])
+def test_int16_is_nearly_lossless(model, data, nonlinear, min_cos):
+    c = QuantContainer(model, "int16", nonlinear=nonlinear)
     c.calibrate(data[:3])
     ref = _ort(model, data[3])
     for mode in ("quantize", "integer"):
         out = c.run_graph(data[3], mode)
-        assert _cosine(out, ref) > 0.999
-        np.testing.assert_array_equal(out.argmax(1), ref.argmax(1))
+        assert _cosine(out, ref) > min_cos
+        top2 = np.sort(ref, axis=1)[:, -2:]
+        # near-ties may flip under the 4-segment PWL approximation
+        margin = 0.0 if nonlinear == "lut" else 0.3
+        clear = (top2[:, 1] - top2[:, 0]) >= margin
+        np.testing.assert_array_equal(
+            out.argmax(1)[clear], ref.argmax(1)[clear]
+        )
 
 
 def test_int8_runs_and_stays_correlated(model, data):
@@ -117,16 +124,24 @@ def test_int8_runs_and_stays_correlated(model, data):
         assert _cosine(c.run_graph(data[3], mode), ref) > 0.8
 
 
-def test_attention_is_one_layer_and_only_norm_and_gather_stay_generic(model):
-    c = QuantContainer(model)
+def test_attention_is_one_layer_and_only_layernorm_stays_float_in_lut_mode(
+    model,
+):
+    c = QuantContainer(model, nonlinear="lut")
     kinds = Counter(type(l).__name__ for l in c.layers)
     assert kinds["MultiHeadAttentionQuantize"] == 2
-    generic = {
-        l.node.op_type
-        for l in c.layers
-        if type(l).__name__ == "BaseQuantLayer"
-    }
-    assert generic == {"LayerNormalization", "Gather"}
+    generic = {l.node.op_type for l in c.float_fallbacks()}
+    assert generic == {"LayerNormalization"}
+
+
+def test_pwl_mode_is_fully_integer(model, data):
+    c = QuantContainer(model, "int16", strict=True)  # raises otherwise
+    assert c.float_fallbacks() == []
+    kinds = Counter(type(l).__name__ for l in c.layers)
+    assert kinds["LayerNormQuantize"] == 5
+    assert kinds["MultiHeadAttentionQuantize"] == 2
+    assert kinds["ActivationQuantize"] == 2  # GELU, 4-segment PWL
+    assert all(ok for *_, ok in c.integer_report())
 
 
 def test_backends_bit_exact_on_vit(model, data, monkeypatch):

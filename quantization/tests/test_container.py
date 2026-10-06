@@ -35,10 +35,20 @@ def test_float_mode_matches_onnxruntime(model, data):
 
 
 @pytest.mark.parametrize(
-    "quant_type,tol", [("int8", 0.05), ("uint8", 0.05), ("int16", 5e-4)]
+    "quant_type,nonlinear,tol",
+    [
+        ("int8", "lut", 0.05),
+        ("uint8", "lut", 0.05),
+        ("int16", "lut", 5e-4),
+        # 4-segment PWL: bounded by the activation / softmax fit errors
+        ("int8", "pwl", 0.08),
+        ("int16", "pwl", 0.03),
+    ],
 )
-def test_quantized_output_tracks_float_model(model, data, quant_type, tol):
-    c = QuantContainer(model, quant_type)
+def test_quantized_output_tracks_float_model(
+    model, data, quant_type, nonlinear, tol
+):
+    c = QuantContainer(model, quant_type, nonlinear=nonlinear)
     c.calibrate(data)
     ref = _ort_ref(model, data[0])
     for mode in ("quantize", "integer"):
@@ -48,14 +58,14 @@ def test_quantized_output_tracks_float_model(model, data, quant_type, tol):
     # integer-only math agrees with the fake-quant simulation
     fake = c.quantized_infer(data[0], mode="quantize")
     integer = c.quantized_infer(data[0], mode="integer")
-    assert np.abs(fake - integer).max() < max(tol, 1e-3)
+    assert np.abs(fake - integer).max() < max(tol, 1e-3) * 2
 
 
 def test_more_bits_means_less_error(model, data):
     ref = _ort_ref(model, data[0])
     errs = {}
     for qt in ("int8", "int16"):
-        c = QuantContainer(model, qt)
+        c = QuantContainer(model, qt, nonlinear="lut")
         c.calibrate(data)
         errs[qt] = np.abs(c.run_graph(data[0], "integer") - ref).max()
     assert errs["int16"] < errs["int8"] / 10

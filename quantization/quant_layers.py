@@ -19,7 +19,7 @@ layer simply reads its inputs' parameters and publishes its outputs'.
 
 import numpy as np
 
-from quantization import native
+from quantization import int_ops, native, pwl
 from quantization.float_ops import UNARY_OPS, conv_pads, run_node
 from quantization.utils import (
     QParams,
@@ -75,6 +75,10 @@ class BaseQuantLayer:
     path with real integer arithmetic.
     """
 
+    #: ``"pwl"``: non-linear functions as <= 4-segment piecewise-linear integer
+    #: functions (full integer pipeline); ``"lut"``: tabulated / float.
+    nonlinear = "pwl"
+
     def __init__(self, node, graph, quant_type="int8", per_channel=True):
         self.node = node
         self.graph = graph
@@ -89,6 +93,7 @@ class BaseQuantLayer:
         self.out_max = [None] * len(node.outputs)
         self.in_qp = []
         self.out_qp = []
+        self.in_range = []
 
     # -------------------------------------------------------- bookkeeping ----
     def _select_data_inputs(self):
@@ -157,14 +162,25 @@ class BaseQuantLayer:
     def finalize_calibration(self, container):
         """Derives all quantization parameters from the observed ranges."""
         self.in_qp = [container.qparams[n] for n in self.data_inputs]
+        self.in_range = [
+            container.tensor_range.get(n) for n in self.data_inputs
+        ]
         self.out_qp = self._default_out_qparams()
-        for name, qp in zip(self.node.outputs, self.out_qp):
+        for i, (name, qp) in enumerate(zip(self.node.outputs, self.out_qp)):
             container.qparams[name] = qp
+            if self.out_min[i] is not None:
+                container.tensor_range[name] = (
+                    self.out_min[i],
+                    self.out_max[i],
+                )
         self.prepare()
 
     def load_qparams(self, container):
         """Restores the parameters from ``container.qparams`` (after load)."""
         self.in_qp = [container.qparams[n] for n in self.data_inputs]
+        self.in_range = [
+            container.tensor_range.get(n) for n in self.data_inputs
+        ]
         self.out_qp = [container.qparams[n] for n in self.node.outputs]
         self.prepare()
 
@@ -440,8 +456,13 @@ class MultiHeadAttentionQuantize(BaseQuantLayer):
         x = self._fq_inputs(inputs)[0]
         q, k, v = self._split_heads(x)
         logits = np.matmul(q, k.transpose(0, 1, 3, 2)).astype(np.float64)
+        soft = (
+            int_ops.softmax_float(logits)
+            if self.nonlinear == "pwl"
+            else self._softmax(logits)
+        )
         probs = fake_quantize(
-            self._softmax(logits),
+            soft,
             self.p_scale,
             self.p_zp,
             self.p_qmin,
@@ -465,15 +486,27 @@ class MultiHeadAttentionQuantize(BaseQuantLayer):
         o_acc = np.empty((b, heads, t, hd), dtype=acc_dtype)
         for i in range(b):
             for h in range(heads):
-                logits = native.gemm_int(
+                acc = native.gemm_int(
                     q[i, h], np.ascontiguousarray(k[i, h].T), wide_qk
-                ).astype(np.float64) * (qp.scale * qp.scale)
-                p = self._softmax(logits)
-                p_int = np.clip(
-                    np.round(p / self.p_scale) + self.p_zp,
-                    self.p_qmin,
-                    self.p_qmax,
-                ).astype(np.int32)
+                )
+                if self.nonlinear == "pwl":  # integer exp / reciprocal
+                    p_int = int_ops.softmax(
+                        acc,
+                        qp.scale * qp.scale,
+                        self.p_scale,
+                        self.p_zp,
+                        self.p_qmin,
+                        self.p_qmax,
+                    )
+                else:
+                    p = self._softmax(
+                        acc.astype(np.float64) * (qp.scale * qp.scale)
+                    )
+                    p_int = np.clip(
+                        np.round(p / self.p_scale) + self.p_zp,
+                        self.p_qmin,
+                        self.p_qmax,
+                    ).astype(np.int32)
                 o_acc[i, h] = native.gemm_int(
                     p_int - self.p_zp, v[i, h], wide_pv
                 )
@@ -533,33 +566,206 @@ class BatchNormalizationQuantize(BaseQuantLayer):
 
 # -------------------------------------------------------------- activations --
 class ActivationQuantize(BaseQuantLayer):
-    """Element-wise unary function evaluated through an integer LUT."""
+    """Element-wise unary function as an integer piecewise-linear function.
+
+    With ``nonlinear="pwl"`` (default) the function is approximated on the
+    calibrated input range by a continuous PWL with at most four segments and
+    evaluated with integer arithmetic only (one compare per knot, one
+    fixed-point multiply). With ``nonlinear="lut"`` it is tabulated instead
+    (inputs of at most 16 bits).
+    """
+
+    pwl_domain_margin = 0.01
+    #: ``"data"`` (default) fits the expected squared error under the
+    #: calibration distribution; ``"minimax"`` the worst case over the
+    #: whole range.
+    pwl_fit = "data"
+    #: percentage of samples ignored at each end when choosing the fit domain
+    #: (the end segments extend linearly beyond it); 0 keeps the full range.
+    pwl_clip_percentile = 0.05
+    max_samples = 200_000
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._samples = []
+        self._rng = np.random.default_rng(0)
+        self.pwl_state_override = None
 
     def _select_data_inputs(self):
         return [self.node.inputs[0]]
 
+    def calibrate(self, inputs):
+        flat = np.asarray(inputs[0]).reshape(-1)
+        keep = min(flat.size, 20_000)
+        picked = self._rng.choice(flat, keep, replace=False)
+        self._samples.append(
+            np.concatenate([picked, [flat.min(), flat.max()]])
+        )
+        return super().calibrate(inputs)
+
     @staticmethod
-    def supports(node, graph, quant_type):
-        """True if ``node`` can be tabulated for ``quant_type``."""
+    def supports(node, graph, quant_type, nonlinear="pwl"):
+        """True if ``node`` can be evaluated for ``quant_type``."""
         num_bits, _ = parse_quant_type(quant_type)
-        if num_bits > MAX_LUT_BITS:
+        if nonlinear == "lut" and num_bits > MAX_LUT_BITS:
             return False
         if node.op_type == "Clip":
             return all(graph.is_constant(i) for i in node.inputs[1:] if i)
         return node.op_type in UNARY_OPS or node.op_type == "FusedElementwise"
 
+    def _real_function(self, x):
+        return self._run_float([np.asarray(x, dtype=np.float32)])[0]
+
     def prepare(self):
-        qp = self.in_qp[0]
-        q_in = np.arange(qp.qmin, qp.qmax + 1, dtype=np.int64)
-        x = dequantize(q_in.astype(np.int32), qp.scale, qp.zp)
-        y = self._run_float([x])[0]
-        o = self.out_qp[0]
-        self.lut = quantize(y, o.scale, o.zp, o.qmin, o.qmax).astype(np.int32)
-        self.lut_offset = qp.qmin
+        qp, o = self.in_qp[0], self.out_qp[0]
+        if self.nonlinear == "lut":
+            q_in = np.arange(qp.qmin, qp.qmax + 1, dtype=np.int64)
+            x = dequantize(q_in.astype(np.int32), qp.scale, qp.zp)
+            y = self._run_float([x])[0]
+            self.lut = quantize(y, o.scale, o.zp, o.qmin, o.qmax).astype(
+                np.int32
+            )
+            self.lut_offset = qp.qmin
+            return
+        lo, hi = self.in_range[0] or (
+            (qp.qmin - qp.zp) * qp.scale,
+            (qp.qmax - qp.zp) * qp.scale,
+        )
+        pad = self.pwl_domain_margin * max(hi - lo, qp.scale)
+        lo = max(lo - pad, (qp.qmin - qp.zp) * qp.scale)
+        hi = min(hi + pad, (qp.qmax - qp.zp) * qp.scale)
+        samples = (
+            np.concatenate(self._samples)[: self.max_samples * 2]
+            if self._samples
+            else None
+        )
+        if self.pwl_state_override is not None:  # restored by load()
+            x, y = self.pwl_state_override
+            self.pwl_float = pwl.PWL(np.asarray(x), np.asarray(y))
+        else:
+            fit_lo, fit_hi = lo, hi
+            if samples is not None and self.pwl_clip_percentile > 0:
+                p = self.pwl_clip_percentile
+                fit_lo, fit_hi = np.percentile(samples, [p, 100 - p])
+                fit_lo, fit_hi = max(fit_lo, lo), min(fit_hi, hi)
+            self.pwl_float = pwl.fit_pwl(
+                self._real_function,
+                fit_lo,
+                fit_hi,
+                samples=samples if self.pwl_fit == "data" else None,
+            )
+        self.pwl_int = pwl.to_integer(
+            self.pwl_float, qp.scale, qp.zp, o.scale, o.zp, o.qmin, o.qmax
+        )
+        self.pwl_domain = (lo, hi)
+        self.pwl_error = self.pwl_float.max_error
+        self.pwl_rmse = None
+        if samples is not None:
+            err = self.pwl_float(samples) - self._real_function(samples)
+            self.pwl_rmse = float(np.sqrt(np.mean(err**2)))
+
+    def quantized_infer(self, inputs):
+        if self.nonlinear == "lut":
+            return super().quantized_infer(inputs)
+        self._check_ready()
+        x = self._fq_inputs(inputs)[0]
+        y = self.pwl_float(x).astype(np.float32)
+        return self._fq_outputs([y])
 
     def quantized_infer_integer(self, inputs):
         self._check_ready()
-        return [native.lut(np.asarray(inputs[0]), self.lut, self.lut_offset)]
+        x = np.asarray(inputs[0])
+        if self.nonlinear == "lut":
+            return [native.lut(x, self.lut, self.lut_offset)]
+        return [self.pwl_int(x)]
+
+
+class SoftmaxQuantize(BaseQuantLayer):
+    """Integer-only softmax (``2^x`` by shifts + PWL, reciprocal by PWL)."""
+
+    def _select_data_inputs(self):
+        return [self.node.inputs[0]]
+
+    @staticmethod
+    def supports(node, graph, opset):
+        """Softmax over a constant axis (opset >= 13 semantics)."""
+        return node.op_type == "Softmax" and (
+            opset >= 13 or node.attr("axis", -1) == -1
+        )
+
+    def quantized_infer(self, inputs):
+        self._check_ready()
+        x = self._fq_inputs(inputs)[0]
+        p = int_ops.softmax_float(x, self.node.attr("axis", -1))
+        return self._fq_outputs([p.astype(np.float32)])
+
+    def quantized_infer_integer(self, inputs):
+        self._check_ready()
+        qp, o = self.in_qp[0], self.out_qp[0]
+        x = np.asarray(inputs[0])
+        axis = self.node.attr("axis", -1)
+        moved = np.moveaxis(x, axis, -1)
+        codes = int_ops.softmax(moved, qp.scale, o.scale, o.zp, o.qmin, o.qmax)
+        return [np.ascontiguousarray(np.moveaxis(codes, -1, axis))]
+
+
+class LayerNormQuantize(BaseQuantLayer):
+    """Integer-only LayerNorm over the last axis (``1/sqrt`` by PWL)."""
+
+    def _select_data_inputs(self):
+        return [self.node.inputs[0]]
+
+    @staticmethod
+    def supports(node, graph):
+        """LayerNorm over the last axis with constant gamma / beta."""
+        if node.op_type != "LayerNormalization":
+            return False
+        if node.attr("axis", -1) != -1:
+            return False
+        return all(graph.is_constant(i) for i in node.inputs[1:] if i)
+
+    def prepare(self):
+        init = self.graph.initializers
+        gamma = init[self.node.inputs[1]]
+        beta = (
+            init[self.node.inputs[2]]
+            if len(self.node.inputs) > 2 and self.node.inputs[2]
+            else np.zeros_like(gamma)
+        )
+        o = self.out_qp[0]
+        self.eps = float(self.node.attr("epsilon", 1e-5))
+        self._mult, self._shift, self._post = int_ops.prepare_layer_norm(
+            gamma, beta, o.scale
+        )
+
+    def quantized_infer(self, inputs):
+        self._check_ready()
+        init = self.graph.initializers
+        x = self._fq_inputs(inputs)[0]
+        gamma = init[self.node.inputs[1]]
+        beta = (
+            init[self.node.inputs[2]]
+            if len(self.node.inputs) > 2 and self.node.inputs[2]
+            else 0.0
+        )
+        y = int_ops.layer_norm_float(x, gamma, beta, self.eps)
+        return self._fq_outputs([y.astype(np.float32)])
+
+    def quantized_infer_integer(self, inputs):
+        self._check_ready()
+        qp, o = self.in_qp[0], self.out_qp[0]
+        out = int_ops.layer_norm(
+            np.asarray(inputs[0]),
+            qp.scale,
+            self.eps,
+            self._mult,
+            self._shift,
+            self._post,
+            o.zp,
+            o.qmin,
+            o.qmax,
+        )
+        return [out]
 
 
 # ------------------------------------------------------------- element-wise --
@@ -689,6 +895,7 @@ class ShapingQuantize(BaseQuantLayer):
     """
 
     SUPPORTED = {
+        "Gather",
         "Reshape",
         "Flatten",
         "Squeeze",
@@ -740,8 +947,23 @@ class ShapingQuantize(BaseQuantLayer):
         return [np.ascontiguousarray(o, dtype=np.int32) for o in outs]
 
 
-def map_node_to_quant(node, graph, quant_type="int8", per_channel=True):
-    """Chooses the quantized layer implementation for an ONNX node."""
+def map_node_to_quant(
+    node, graph, quant_type="int8", per_channel=True, nonlinear="pwl"
+):
+    """Chooses the quantized layer implementation for an ONNX node.
+
+    ``nonlinear="pwl"`` evaluates every non-linear function (activations,
+    softmax, layer norm) with integer piecewise-linear functions of at most
+    four segments; ``"lut"`` keeps lookup tables and float fallbacks.
+    """
+    if nonlinear not in ("pwl", "lut"):
+        raise ValueError("nonlinear must be 'pwl' or 'lut'")
+    layer = _map_node(node, graph, quant_type, per_channel, nonlinear)
+    layer.nonlinear = nonlinear
+    return layer
+
+
+def _map_node(node, graph, quant_type, per_channel, nonlinear):
     op = node.op_type
     const = graph.is_constant
     args = (node, graph, quant_type, per_channel)
@@ -768,7 +990,13 @@ def map_node_to_quant(node, graph, quant_type="int8", per_channel=True):
         return MultiHeadAttentionQuantize(*args)
     if op == "BatchNormalization" and all(const(i) for i in node.inputs[1:5]):
         return BatchNormalizationQuantize(*args)
-    if ActivationQuantize.supports(node, graph, quant_type):
+    if nonlinear == "pwl" and SoftmaxQuantize.supports(
+        node, graph, graph.opset
+    ):
+        return SoftmaxQuantize(*args)
+    if nonlinear == "pwl" and LayerNormQuantize.supports(node, graph):
+        return LayerNormQuantize(*args)
+    if ActivationQuantize.supports(node, graph, quant_type, nonlinear):
         return ActivationQuantize(*args)
     if op in ("Add", "Sub") and not all(const(i) for i in node.inputs):
         return AddQuantize(*args)

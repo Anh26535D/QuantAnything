@@ -7,7 +7,7 @@ import numpy as np
 
 from quantization import float_ops
 from quantization.onnx_graph import OnnxGraph
-from quantization.quant_layers import map_node_to_quant
+from quantization.quant_layers import BaseQuantLayer, map_node_to_quant
 from quantization.utils import (
     QParams,
     calculate_scale_zp,
@@ -17,6 +17,10 @@ from quantization.utils import (
 )
 
 MODES = ("float", "calibrate", "quantize", "integer")
+
+
+class NotIntegerError(ValueError):
+    """Raised in ``strict`` mode when a layer would fall back to float."""
 
 
 def _is_batches(x):
@@ -38,16 +42,31 @@ class QuantContainer:
         per_channel: quantize conv / dense weights per output channel.
     """
 
-    def __init__(self, model, quant_type="int8", per_channel=True):
+    def __init__(
+        self,
+        model,
+        quant_type="int8",
+        per_channel=True,
+        nonlinear="pwl",
+        strict=False,
+    ):
         self.graph = OnnxGraph.from_model(model)
         self.quant_type = quant_type
         self.per_channel = per_channel
+        self.nonlinear = nonlinear
         self.quant_layers = {}
         for node in self.graph.nodes:
             self.quant_layers[node.name] = map_node_to_quant(
-                node, self.graph, quant_type, per_channel
+                node, self.graph, quant_type, per_channel, nonlinear
+            )
+        fallbacks = self.float_fallbacks()
+        if strict and fallbacks:
+            raise NotIntegerError(
+                "layers without an integer implementation: "
+                + ", ".join(f"{l.name} ({l.node.op_type})" for l in fallbacks)
             )
         self.qparams = {}
+        self.tensor_range = {}
         self._input_range = {}
         self._const_names = self._constant_operands()
         self._const_q = {}
@@ -62,6 +81,22 @@ class QuantContainer:
                 if self.graph.is_constant(n) and n not in names:
                     names.append(n)
         return names
+
+    def float_fallbacks(self):
+        """Layers that still run as dequantize -> float -> quantize."""
+        return [l for l in self.layers if type(l) is BaseQuantLayer]
+
+    def integer_report(self):
+        """``[(layer name, op type, implementation, integer-only?)]``."""
+        return [
+            (
+                l.name,
+                l.node.op_type,
+                type(l).__name__,
+                type(l) is not BaseQuantLayer,
+            )
+            for l in self.layers
+        ]
 
     @property
     def layers(self):
@@ -93,7 +128,9 @@ class QuantContainer:
     def finalize(self):
         """Computes qparams from the collected ranges (after calibrate)."""
         self.qparams = {}
+        self.tensor_range = {}
         for name, (lo, hi) in self._input_range.items():
+            self.tensor_range[name] = (lo, hi)
             self.qparams[name] = QParams(
                 *calculate_scale_zp(lo, hi, self.quant_type)
             )
@@ -104,6 +141,7 @@ class QuantContainer:
                 *calculate_scale_zp(value.min(), value.max(), self.quant_type)
             )
             self.qparams[name] = qp
+            self.tensor_range[name] = (float(value.min()), float(value.max()))
             self._const_q[name] = quantize(
                 value, qp.scale, qp.zp, qp.qmin, qp.qmax
             )
@@ -232,7 +270,17 @@ class QuantContainer:
         payload = {
             "quant_type": self.quant_type,
             "per_channel": self.per_channel,
+            "nonlinear": self.nonlinear,
             "qparams": {k: v.to_dict() for k, v in self.qparams.items()},
+            "ranges": {k: list(v) for k, v in self.tensor_range.items()},
+            "pwl": {
+                l.name: {
+                    "x": l.pwl_float.x.tolist(),
+                    "y": l.pwl_float.y.tolist(),
+                }
+                for l in self.layers
+                if getattr(l, "pwl_float", None) is not None
+            },
         }
         Path(path).write_text(json.dumps(payload, indent=2))
 
@@ -240,7 +288,15 @@ class QuantContainer:
     def load(cls, model, path):
         """Rebuilds a calibrated container from ``model`` and a saved JSON."""
         payload = json.loads(Path(path).read_text())
-        container = cls(model, payload["quant_type"], payload["per_channel"])
+        container = cls(
+            model,
+            payload["quant_type"],
+            payload["per_channel"],
+            payload.get("nonlinear", "lut"),
+        )
+        container.tensor_range = {
+            k: tuple(v) for k, v in payload.get("ranges", {}).items()
+        }
         container.qparams = {
             k: QParams.from_dict(v) for k, v in payload["qparams"].items()
         }
@@ -260,6 +316,11 @@ class QuantContainer:
                 qp.zp,
                 qp.qmin,
                 qp.qmax,
+            )
+        for name, state in payload.get("pwl", {}).items():
+            container.quant_layers[name].pwl_state_override = (
+                state["x"],
+                state["y"],
             )
         for layer in container.quant_layers.values():
             layer.load_qparams(container)

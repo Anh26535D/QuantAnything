@@ -209,6 +209,43 @@ simulator is slow on the full ~19.7k-image gallery, so subsample with
 
 ---
 
+### Full-integer inference (piecewise-linear non-linearities)
+
+`QuantContainer(model, "int16", nonlinear="pwl", strict=True)` (`"pwl"` is the
+default) evaluates **every** non-linear function with integer arithmetic only,
+as a continuous piecewise-linear function with **at most four segments**
+(`quantization/pwl.py`, `quantization/int_ops.py`); `strict=True` raises
+`NotIntegerError` if any layer would still fall back to float
+(`container.integer_report()` lists them).
+
+| Function | Integer implementation |
+| :--- | :--- |
+| GELU, SiLU, sigmoid, tanh, ... | 4-segment PWL on the calibrated input range: `y = y_i + mbqm(x - x_i, M_i, shift_i)`, segment picked by <= 3 compares |
+| ReLU, LeakyReLU, Clip, HardSigmoid | exact (2-3 segments), kinks detected analytically |
+| softmax `exp` | `e^-x = 2^-n * 2^-f`: shift by the integer part, 4-segment PWL of `2^-f` on `[0,1)` (0.19% max relative error) |
+| softmax `1/sum` | leading-bit normalization to a mantissa in `[1,2)` + 4-segment PWL of `1/m` (0.38%) |
+| LayerNorm `1/sqrt(var)` | variance normalized to `[1,4)` with an even exponent (`2^-e/2` is a shift) + 4-segment PWL of `1/sqrt(m)` (0.58%) |
+
+The knots are found offline: dynamic programming over break points plus a
+least-squares / Lawson refinement of the knot values. Activations are fitted to
+the *distribution* of the calibration data (squared error, 0.05% of the
+samples ignored at each end; the end segments extend linearly), which matters a
+lot for GELU whose pre-activations span e.g. `[-11, 10]` but live mostly in
+`[-3, 3]`. Measured on ViT-Ti/16 (fully integer, 0 float layers, int16):
+
+| Variant | logit cosine vs float | top-1 on the test photo |
+| :--- | :--- | :--- |
+| exact lookup tables (`nonlinear="lut"`) | 0.9998 | Samoyed 0.812 |
+| 4-segment PWL, minimax fit over the full range | 0.913 | Samoyed 0.691 |
+| 4-segment PWL, data-driven fit (default) | **0.9935** | Samoyed 0.764 |
+
+Ablation: the PWL softmax and PWL LayerNorm alone cost almost nothing (cosine
+0.9994 / 0.9995 when GELU is exact); GELU is the one function where four
+segments are visibly coarse. int8 still collapses on ViTs for the reason
+explained above (residual stream), independently of the PWL.
+
+---
+
 ## 4. Timeline for Improvements
 
 | Phase | Milestone | Expected Deliverable | Timeline |

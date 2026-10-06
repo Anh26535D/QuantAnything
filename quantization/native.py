@@ -117,6 +117,7 @@ def _declare(lib):
         "qa_add": (None, [p, p, p] + [i64] * 11),
         "qa_mul": (None, [p, p, p] + [i64] * 8),
         "qa_lut": (None, [p, p, i64, i64, p, i64]),
+        "qa_pwl": (None, [p, p, i64, p, p, p, p, i64, i64, i64]),
         "qa_quantize_f32": (None, [p, p, i64, f64, i64, i64, i64]),
         "qa_dequantize_f32": (None, [p, p, i64, f64, i64]),
     }
@@ -528,6 +529,43 @@ def lut(x, table, offset):
     out = np.empty_like(x)
     _lib.qa_lut(
         _ptr(x), _ptr(out), x.size, int(offset), _ptr(table), len(table)
+    )
+    return out
+
+
+def pwl(x, x_k, y_k, mult, shift, qmin, qmax):
+    """Integer piecewise-linear function with at most four segments.
+
+    ``y = y_k[i] + mbqm(x - x_k[i], mult[i], shift[i])`` where ``i`` counts the
+    knots ``x_k[1:]`` that are ``<= x``; the result is clipped to
+    ``[qmin, qmax]`` (int32 output).
+    """
+    x_k, y_k = _c(x_k, np.int64), _c(y_k, np.int64)
+    mult, shift = _c(mult, np.int64), _c(shift, np.int64)
+    nseg = len(x_k)
+    if nseg > 4:
+        raise ValueError("at most 4 segments are supported")
+    lo, hi = max(int(qmin), -(2**31)), min(int(qmax), 2**31 - 1)
+    if _lib is None:
+        xv = _as_i64(x)
+        idx = np.zeros(xv.shape, dtype=np.int64)
+        for j in range(1, nseg):
+            idx += xv >= x_k[j]
+        r = y_k[idx] + mbqm_np(xv - x_k[idx], mult[idx], shift[idx])
+        return np.clip(r, lo, hi).astype(np.int32)
+    x = _c(x, np.int32)
+    out = np.empty_like(x)
+    _lib.qa_pwl(
+        _ptr(x),
+        _ptr(out),
+        x.size,
+        _ptr(x_k),
+        _ptr(y_k),
+        _ptr(mult),
+        _ptr(shift),
+        nseg,
+        lo,
+        hi,
     )
     return out
 

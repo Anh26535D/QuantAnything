@@ -357,6 +357,23 @@ QA_API void qa_lut(const int32_t* x, int32_t* out, int64_t n, int64_t offset,
     }
 }
 
+// Piecewise-linear function (<= 4 segments), integer only:
+//   s = #{ j >= 1 : x >= xk[j] };  out = clip(yk[s] + mbqm(x - xk[s], m[s], sh[s]))
+QA_API void qa_pwl(const int32_t* x, int32_t* out, int64_t n, const int64_t* xk,
+                   const int64_t* yk, const int64_t* mult, const int64_t* shift,
+                   int64_t nseg, int64_t qmin, int64_t qmax) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n > 65536)
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t xv = x[i];
+        int64_t s = 0;
+        for (int64_t j = 1; j < nseg; ++j) s += (xv >= xk[j]);
+        const i128 v = static_cast<i128>(yk[s]) + mbqm(xv - xk[s], mult[s], shift[s]);
+        out[i] = static_cast<int32_t>(clamp128(v, qmin, qmax));
+    }
+}
+
 // ---- Float <-> integer conversion (per-tensor scale) ----
 
 // q = clip(rint(x / scale) + zp)   (round-half-to-even, like numpy)

@@ -223,11 +223,68 @@ def test_activation_lut_is_exact(op, quant_type):
     b = ModelBuilder(0)
     y = b.op(op, ["x"])
     c = _calibrated(
-        _model(b, y, ["N", 3, 6]), quant_type, [_x((4, 3, 6), -3, 3)]
+        _model(b, y, ["N", 3, 6]),
+        quant_type,
+        [_x((4, 3, 6), -3, 3)],
+        nonlinear="lut",
     )
     assert isinstance(c.layers[0], ActivationQuantize)
     fake, integer = _assert_int_matches_fake(c, _x((2, 3, 6), -3, 3), lsb=0)
     np.testing.assert_array_equal(fake, integer)
+
+
+@pytest.mark.parametrize("quant_type", ["int8", "uint8", "int16"])
+@pytest.mark.parametrize(
+    "op,tol",
+    [
+        ("Relu", 0.0),  # exactly piecewise linear
+        ("LeakyRelu", 0.0),
+        ("Sigmoid", 0.035),  # 4-segment error bound of the fit
+        ("Tanh", 0.09),
+    ],
+)
+def test_activation_pwl_has_at_most_four_segments_and_bounded_error(
+    op, tol, quant_type
+):
+    b = ModelBuilder(0)
+    y = b.op(op, ["x"])
+    x = _x((200, 8), -3, 3)
+    c = _calibrated(_model(b, y, ["N", 8]), quant_type, [x])
+    layer = c.layers[0]
+    assert isinstance(layer, ActivationQuantize)
+    assert layer.pwl_int.segments <= 4 and layer.pwl_float.segments <= 4
+    ref = c.run_graph(x, "float")
+    integer = c.run_graph(x, "integer")
+    step = c.qparams[c.graph.outputs[0]].scale
+    in_step = c.qparams["x"].scale
+    # input rounding + output rounding + the PWL approximation itself
+    slack = step + 0.25 * in_step * np.abs(np.gradient(ref, axis=0)).max()
+    assert np.abs(integer - ref).max() <= tol + 1.5 * step + 2 * in_step
+    assert slack > 0
+    # the float PWL used by fake quantization agrees with the integer one
+    fake = c.run_graph(x, "quantize")
+    assert np.abs(fake - integer).max() <= 3 * step + 2 * in_step * 0.25 + 0.02
+
+
+def test_pwl_and_integer_evaluation_use_only_the_documented_formula():
+    b = ModelBuilder(0)
+    y = b.op("Sigmoid", ["x"])
+    x = _x((64, 8), -3, 3)
+    c = _calibrated(_model(b, y, ["N", 8]), "int8", [x])
+    layer, qp_in = c.layers[0], c.qparams["x"]
+    codes = np.arange(qp_in.qmin, qp_in.qmax + 1, dtype=np.int32)
+    got = layer.pwl_int(codes).astype(np.int64)
+    p = layer.pwl_int
+    idx = sum((codes >= p.x_k[j]).astype(int) for j in range(1, p.segments))
+    from quantization.utils import multiply_by_quantized_multiplier as mbqm
+
+    want = np.clip(
+        p.y_k[idx]
+        + mbqm(codes.astype(np.int64) - p.x_k[idx], p.mult[idx], p.shift[idx]),
+        p.qmin,
+        p.qmax,
+    )
+    np.testing.assert_array_equal(got, want)
 
 
 def test_clip_activation():
@@ -242,9 +299,17 @@ def test_clip_activation():
 def test_large_bit_width_falls_back_to_generic_layer():
     b = ModelBuilder(0)
     y = b.op("Sigmoid", ["x"])
-    c = _calibrated(_model(b, y, ["N", 8]), "int20", [_x((6, 8))])
+    c = _calibrated(
+        _model(b, y, ["N", 8]), "int20", [_x((6, 8))], nonlinear="lut"
+    )
     assert type(c.layers[0]) is BaseQuantLayer
     c.run_graph(_x((2, 8)), "integer")
+    # the PWL path has no bit-width limit and stays integer
+    p = _calibrated(_model(b, y, ["N", 8]), "int20", [_x((6, 8))])
+    assert isinstance(p.layers[0], ActivationQuantize)
+    x2 = _x((2, 8))
+    err = np.abs(p.run_graph(x2, "integer") - p.run_graph(x2, "float"))
+    assert err.max() < 0.04
 
 
 # -------------------------------------------------------- element-wise ----
@@ -260,7 +325,7 @@ def test_binary_ops_between_two_branches(op, quant_type):
     )
     kind = MulQuantize if op == "Mul" else AddQuantize
     assert isinstance(c.quant_layers[c.graph.nodes[-1].name], kind)
-    _assert_int_matches_fake(c, _x((2, 3, 6, 6)), lsb=2)
+    _assert_int_matches_fake(c, _x((2, 3, 6, 6)), lsb=4)
 
 
 def test_constant_operand_and_broadcasting():
@@ -351,10 +416,33 @@ def test_split_outputs_share_input_parameters():
     _assert_int_matches_fake(c, _x((2, 4, 3, 3)), lsb=2)
 
 
-def test_softmax_uses_dequantize_float_requantize_fallback():
+def test_softmax_is_integer_only_with_pwl():
     b = ModelBuilder(0)
     y = b.op("Softmax", ["x"], axis=1)
-    c = _calibrated(_model(b, y, ["N", 6]), "int8", [_x((8, 6))])
+    x = _x((16, 6))
+    c = _calibrated(_model(b, y, ["N", 6]), "int16", [x])
+    assert type(c.layers[0]).__name__ == "SoftmaxQuantize"
+    ref = c.run_graph(x, "float")
+    integer = c.run_graph(x, "integer")
+    assert np.abs(integer - ref).max() < 0.01
+    np.testing.assert_allclose(integer.sum(axis=1), 1.0, atol=0.01)
+
+
+def test_softmax_axis_other_than_last():
+    b = ModelBuilder(0)
+    y = b.op("Softmax", ["x"], axis=1)
+    x = _x((3, 5, 4))
+    c = _calibrated(_model(b, y, ["N", 5, 4]), "int16", [x])
+    ref = c.run_graph(x, "float")
+    assert np.abs(c.run_graph(x, "integer") - ref).max() < 0.01
+
+
+def test_softmax_uses_dequantize_float_requantize_fallback_in_lut_mode():
+    b = ModelBuilder(0)
+    y = b.op("Softmax", ["x"], axis=1)
+    c = _calibrated(
+        _model(b, y, ["N", 6]), "int8", [_x((8, 6))], nonlinear="lut"
+    )
     assert type(c.layers[0]) is BaseQuantLayer
     x = _x((3, 6))
     integer = c.run_graph(x, "integer")

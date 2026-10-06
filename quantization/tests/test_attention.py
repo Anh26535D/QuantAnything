@@ -71,20 +71,26 @@ def test_vit_attention_is_fused_for_both_scale_styles():
         assert "Softmax" not in [n.op_type for n in g.nodes]
 
 
+@pytest.mark.parametrize("nonlinear", ["lut", "pwl"])
 @pytest.mark.parametrize("quant_type", ["int8", "uint8", "int16"])
-def test_integer_attention_matches_fake_quant(quant_type):
+def test_integer_attention_matches_fake_quant(quant_type, nonlinear):
     model = _core_model()
     cal = [_data(seed=s) for s in (1, 2)]
-    c = QuantContainer(model, quant_type)
+    c = QuantContainer(model, quant_type, nonlinear=nonlinear)
     c.calibrate(cal)
     assert isinstance(c.layers[0], MultiHeadAttentionQuantize)
     x = cal[0]
     fake, integer = c.run_graph(x, "quantize"), c.run_graph(x, "integer")
     step = c.qparams[c.graph.outputs[0]].scale
     noise = 4 * np.finfo(np.float32).eps * np.abs(fake).max()
-    assert np.abs(fake - integer).max() <= 2 * step + noise
+    # the PWL pipeline rounds exp / reciprocal to Q15: a few output steps
+    steps = 2 if nonlinear == "lut" else 8
+    assert np.abs(fake - integer).max() <= steps * step + noise
     ref = c.run_graph(x, "float")
-    tol = {"int16": 2e-3}.get(quant_type, 0.15) * np.abs(ref).max()
+    base = {"int16": 2e-3}.get(quant_type, 0.15)
+    tol = (base if nonlinear == "lut" else max(base, 1.5e-2)) * np.abs(
+        ref
+    ).max()
     assert np.abs(integer - ref).max() < tol
 
 
