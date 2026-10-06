@@ -358,3 +358,50 @@ def test_new_ops_match_onnxruntime():
     )
     model.ir_version = 8
     _check(model, x, atol=1e-5)
+
+
+def test_timm_style_cls_token_shape_chain_is_folded():
+    """cls-token shape chain (ConstantOfShape, Equal, Where) from torch.onnx."""
+    b = ModelBuilder(0)
+    zeros = b.op(
+        "ConstantOfShape",
+        [b.const(np.array([3], np.int64))],
+        value=helper.make_tensor("v", TensorProto.INT64, [1], [0]),
+    )
+    shape = b.const(np.array([1, -1, 8], np.int64))
+    target = b.op(
+        "Where", [b.op("Equal", [shape, b.const(np.int64(-1))]), zeros, shape]
+    )
+    cls = b.weight(1, 1, 8, base="cls")
+    out = b.op("Concat", [b.op("Expand", [cls, target]), "x"], axis=1)
+    x = np.random.default_rng(0).standard_normal((1, 4, 8)).astype(np.float32)
+    graph = helper.make_graph(
+        b.nodes,
+        "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, x.shape)],
+        [helper.make_tensor_value_info(out, TensorProto.FLOAT, None)],
+        b.inits,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    g = OnnxGraph.from_model(model)
+    assert not {"ConstantOfShape", "Equal", "Where", "Expand"} & {
+        n.op_type for n in g.nodes
+    }
+    _check(model, x)
+
+
+def test_comparison_ops():
+    x = np.random.default_rng(0).standard_normal((3, 4)).astype(np.float32)
+    for op in ("Less", "Greater"):
+        node = helper.make_node(op, ["x", "y"], ["o"])
+        from quantization.onnx_graph import Node
+
+        n = Node("n", op, ["x", "y"], ["o"], {})
+        got = float_ops.run_node(n, [x, np.zeros_like(x)])[0]
+        np.testing.assert_array_equal(
+            got, (x < 0) if op == "Less" else (x > 0)
+        )
+        assert node is not None

@@ -395,6 +395,39 @@ def _log_softmax(node, inputs, opset, **kw):
     )
 
 
+@register("ConstantOfShape")
+def _constant_of_shape(node, inputs, opset, **kw):
+    value = node.attr("value")
+    value = np.zeros(1, np.float32) if value is None else np.asarray(value)
+    shape = [int(v) for v in np.asarray(inputs[0]).reshape(-1)]
+    return np.full(shape, value.reshape(-1)[0], dtype=value.dtype)
+
+
+@register("Equal")
+def _equal(node, inputs, opset, **kw):
+    return np.equal(inputs[0], inputs[1])
+
+
+@register("Less")
+def _less(node, inputs, opset, **kw):
+    return np.less(inputs[0], inputs[1])
+
+
+@register("Greater")
+def _greater(node, inputs, opset, **kw):
+    return np.greater(inputs[0], inputs[1])
+
+
+@register("Not")
+def _not(node, inputs, opset, **kw):
+    return np.logical_not(inputs[0])
+
+
+@register("Where")
+def _where(node, inputs, opset, **kw):
+    return np.where(inputs[0], inputs[1], inputs[2])
+
+
 @register("Cast")
 def _cast(node, inputs, opset, **kw):
     from onnx import helper
