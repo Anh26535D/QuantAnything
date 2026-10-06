@@ -361,7 +361,7 @@ def test_new_ops_match_onnxruntime():
 
 
 def test_timm_style_cls_token_shape_chain_is_folded():
-    """cls-token shape chain (ConstantOfShape, Equal, Where) from torch.onnx."""
+    """cls-token shape chain (ConstantOfShape, Equal, Where), torch.onnx."""
     b = ModelBuilder(0)
     zeros = b.op(
         "ConstantOfShape",
