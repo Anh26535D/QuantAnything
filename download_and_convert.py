@@ -1,65 +1,36 @@
-import os
+"""Downloads YOLOv8n-cls and exports it to ONNX (the only model format used).
+
+Needs the optional ``ultralytics`` dependency: ``uv sync --extra export``.
+"""
+
+import argparse
+
 import onnx
-from ultralytics import YOLO
-from onnx2keras.onnx2keras import onnx_to_keras
 
-def sanitize_onnx_model(model):
-    def rename(name):
-        return name.replace('/', '_').replace(':', '_')
-        
-    for inp in model.graph.input:
-        inp.name = rename(inp.name)
-    for out in model.graph.output:
-        out.name = rename(out.name)
-    for init in model.graph.initializer:
-        init.name = rename(init.name)
-    for node in model.graph.node:
-        if node.name:
-            node.name = rename(node.name)
-        inputs = [rename(i) for i in node.input]
-        del node.input[:]
-        node.input.extend(inputs)
-        
-        outputs = [rename(o) for o in node.output]
-        del node.output[:]
-        node.output.extend(outputs)
-    for vi in model.graph.value_info:
-        vi.name = rename(vi.name)
-    return model
+from quantization import OnnxGraph
 
-def main():
-    print("--- Step 1: Loading YOLOv8n-cls model from Ultralytics ---")
-    model = YOLO("yolov8n-cls.pt")
-    
-    print("\n--- Step 2: Exporting to ONNX ---")
-    onnx_path = model.export(format="onnx", imgsz=224)
+
+def main(argv=None):
+    """Exports the model and prints a short summary of the ONNX graph."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--weights", default="yolov8n-cls.pt")
+    parser.add_argument("--imgsz", type=int, default=224)
+    args = parser.parse_args(argv)
+
+    from quantization.evaluator import export_yolov8_cls
+
+    print(f"--- Exporting {args.weights} to ONNX ---")
+    onnx_path = export_yolov8_cls(args.weights, args.imgsz)
     print(f"ONNX model saved at: {onnx_path}")
-    
-    print("\n--- Step 3: Loading ONNX model ---")
-    onnx_model = onnx.load(onnx_path)
-    
-    print("\n--- Step 3.5: Sanitizing ONNX model names for Keras 3.0 ---")
-    onnx_model = sanitize_onnx_model(onnx_model)
-    
-    print("\n--- Step 4: Converting ONNX to Keras ---")
-    try:
-        keras_model = onnx_to_keras(
-            onnx_model,
-            input_names=['images'],
-            input_shapes=[[3, 224, 224]],
-            verbose=True,
-            change_ordering=False
-        )
-        print("\n--- Success! Keras model converted successfully ---")
-        keras_model.summary()
-        
-        # Save keras model structure
-        keras_model.save("yolov8n-cls.keras")
-        print("Keras model saved as yolov8n-cls.keras")
-    except Exception as e:
-        print("\n--- Error during ONNX to Keras conversion ---")
-        import traceback
-        traceback.print_exc()
+
+    onnx.checker.check_model(onnx.load(onnx_path))
+    graph = OnnxGraph.from_model(onnx_path)
+    ops = {}
+    for node in graph.nodes:
+        ops[node.op_type] = ops.get(node.op_type, 0) + 1
+    print(f"Inputs: {[(v.name, v.shape) for v in graph.inputs]}")
+    print(f"Operators: {dict(sorted(ops.items()))}")
+
 
 if __name__ == "__main__":
     main()

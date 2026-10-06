@@ -1,291 +1,267 @@
+"""Quantization container: float / fake-quant / integer ONNX execution."""
+
+import json
+from pathlib import Path
+
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from quantization.utils import dequantize
-from quantization.quant_layers import (
-    BaseQuantLayer,
-    InputQuantize,
-    Conv2DQuantize,
-    BatchNormalizationQuantize,
-    DenseQuantize,
-    ActivationQuantize,
-    AddQuantize,
-    ConcatenateQuantize,
-    GlobalAveragePooling2DQuantize,
-    ShapingQuantize,
-    DepthwiseConv2DQuantize,
-    MultiplyQuantize
+
+from quantization import float_ops
+from quantization.onnx_graph import OnnxGraph
+from quantization.quant_layers import map_node_to_quant
+from quantization.utils import (
+    QParams,
+    calculate_scale_zp,
+    dequantize,
+    fake_quantize,
+    quantize,
 )
 
-def map_layer_to_quant(layer, quant_type="int8"):
-    """
-    Maps a standard Keras layer to its corresponding quantized layer wrapper.
-    """
-    name = type(layer).__name__
-    
-    if isinstance(layer, keras.layers.InputLayer):
-        return InputQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.DepthwiseConv2D):
-        return DepthwiseConv2DQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.Conv2D):
-        return Conv2DQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.BatchNormalization):
-        return BatchNormalizationQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.Dense):
-        return DenseQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.Activation):
-        return ActivationQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.Add):
-        return AddQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.Multiply):
-        return MultiplyQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.Concatenate):
-        return ConcatenateQuantize(layer, quant_type)
-    elif isinstance(layer, keras.layers.GlobalAveragePooling2D):
-        return GlobalAveragePooling2DQuantize(layer, quant_type)
-    elif isinstance(layer, (keras.layers.Reshape, keras.layers.Flatten, keras.layers.ZeroPadding2D, keras.layers.Cropping2D)):
-        return ShapingQuantize(layer, quant_type)
-    elif "Lambda" in name:
-        # Map split Lambda layers to ShapingQuantize (preserves scale/zp)
-        # Map other Lambdas (like Softmax) to BaseQuantLayer (recalculates scale/zp)
-        if "split" in layer.name.lower():
-            return ShapingQuantize(layer, quant_type)
-        else:
-            return BaseQuantLayer(layer, quant_type)
-    else:
-        # Fallback based on input connectivity
-        try:
-            inputs = layer.input
-            if isinstance(inputs, list) and len(inputs) > 1:
-                return AddQuantize(layer, quant_type)
-        except Exception:
-            pass
-        return BaseQuantLayer(layer, quant_type)
+MODES = ("float", "calibrate", "quantize", "integer")
+
+
+def _is_batches(x):
+    """True when ``x`` is an iterable of batches rather than one batch."""
+    return not isinstance(x, (np.ndarray, dict))
 
 
 class QuantContainer:
+    """Post-training static quantization of an ONNX model.
+
+    The model is held as a topologically ordered list of quantized layers
+    (one per ONNX node). Tensor-level quantization parameters are stored in
+    :attr:`qparams`, keyed by tensor name.
+
+    Args:
+        model: ``onnx.ModelProto``, path to an ``.onnx`` file or an
+            :class:`~quantization.onnx_graph.OnnxGraph`.
+        quant_type: e.g. ``"int8"``, ``"uint8"``, ``"int16"``.
+        per_channel: quantize conv / dense weights per output channel.
     """
-    Main container class representing our custom quantization computational graph.
-    """
-    def __init__(self, keras_model, quant_type="int8"):
-        self.model = keras_model
+
+    def __init__(self, model, quant_type="int8", per_channel=True):
+        self.graph = OnnxGraph.from_model(model)
         self.quant_type = quant_type
+        self.per_channel = per_channel
         self.quant_layers = {}
-        
-        # Instantiate quantized wrappers for all layers
-        for layer in self.model.layers:
-            self.quant_layers[layer.name] = map_layer_to_quant(layer, self.quant_type)
+        for node in self.graph.nodes:
+            self.quant_layers[node.name] = map_node_to_quant(
+                node, self.graph, quant_type, per_channel
+            )
+        self.qparams = {}
+        self._input_range = {}
+        self._const_names = self._constant_operands()
+        self._const_q = {}
+        self.calibrated = False
 
-    def calibrate(self, x_calib):
+    # ------------------------------------------------------------ helpers ----
+    def _constant_operands(self):
+        """Constants consumed as quantized activations (e.g. ``x + bias``)."""
+        names = []
+        for layer in self.quant_layers.values():
+            for n in layer.data_inputs:
+                if self.graph.is_constant(n) and n not in names:
+                    names.append(n)
+        return names
+
+    @property
+    def layers(self):
+        """Quantized layers in execution order."""
+        return list(self.quant_layers.values())
+
+    def _feeds(self, x):
+        return float_ops.normalize_feeds(self.graph, x)
+
+    # -------------------------------------------------------- calibration ----
+    def calibrate(self, x_calib, verbose=False):
+        """Runs calibration batches and finalizes every scale / zero point.
+
+        Args:
+            x_calib: one batch (array, or dict keyed by input name) or an
+                iterable of batches.
         """
-        Runs calibration batches to collect min/max activations and finalize scale/zp parameters.
-        x_calib can be a numpy array or a list/generator of batches.
-        """
-        # Support single array or list of arrays
-        if isinstance(x_calib, np.ndarray):
-            batches = [x_calib]
-        else:
-            batches = x_calib
-            
-        print("Starting calibration forward passes...")
-        for batch_idx, batch in enumerate(batches):
+        batches = [x_calib] if not _is_batches(x_calib) else x_calib
+        count = 0
+        for batch in batches:
             self.run_graph(batch, mode="calibrate")
-            
-        print("Finalizing calibration scale and zero-point parameters...")
-        for name, q_layer in self.quant_layers.items():
-            q_layer.finalize_calibration(container=self)
-        print("Calibration completed successfully.")
+            count += 1
+        if count == 0:
+            raise ValueError("no calibration data provided")
+        self.finalize()
+        if verbose:
+            print(f"Calibrated on {count} batch(es).")
 
+    def finalize(self):
+        """Computes qparams from the collected ranges (after calibrate)."""
+        self.qparams = {}
+        for name, (lo, hi) in self._input_range.items():
+            self.qparams[name] = QParams(
+                *calculate_scale_zp(lo, hi, self.quant_type)
+            )
+        self._const_q = {}
+        for name in self._const_names:
+            value = self.graph.initializers[name].astype(np.float32)
+            qp = QParams(
+                *calculate_scale_zp(value.min(), value.max(), self.quant_type)
+            )
+            self.qparams[name] = qp
+            self._const_q[name] = quantize(
+                value, qp.scale, qp.zp, qp.qmin, qp.qmax
+            )
+        for layer in self.quant_layers.values():
+            layer.finalize_calibration(self)
+        self.calibrated = True
+
+    # ------------------------------------------------------- execution ----
     def quantized_infer(self, x, mode="quantize"):
-        """
-        Runs quantized forward inference on the custom computational graph.
-        mode can be "quantize" (fake quantization) or "integer" (integer-only arithmetic).
-        """
+        """Quantized forward pass; ``mode`` is quantize or integer."""
         return self.run_graph(x, mode=mode)
 
     def run_graph(self, x, mode="quantize"):
-        """
-        Executes the topological graph pass layer by layer.
-        """
-        tensor_values = {}
-        
-        # Feed inputs
-        # If x is a single input, map it to the model's first input tensor
-        if not isinstance(x, dict):
-            input_tensor = self.model.inputs[0]
-            tensor_values[id(input_tensor)] = x
-        else:
-            for k, v in x.items():
-                for inp in self.model.inputs:
-                    if inp.name == k:
-                        tensor_values[id(inp)] = v
-                        break
-                        
-        # Iterate over layers in topological order
-        for layer in self.model.layers:
-            # InputLayer outputs are already fed into tensor_values
-            if isinstance(layer, keras.layers.InputLayer):
-                layer_output = layer.output
-                q_layer = self.quant_layers[layer.name]
-                if mode == "calibrate":
-                    tensor_values[id(layer_output)] = q_layer.calibrate(x)
-                elif mode == "integer":
-                    tensor_values[id(layer_output)] = q_layer.quantized_infer_integer(x)
-                elif mode == "quantize":
-                    tensor_values[id(layer_output)] = q_layer.quantized_infer(x)
-                else:
-                    if id(layer_output) not in tensor_values or tensor_values[id(layer_output)] is x:
-                        if not isinstance(x, dict):
-                            tensor_values[id(layer_output)] = x
-                continue
-                
-            q_layer = self.quant_layers[layer.name]
-            
-            # Retrieve inputs for this layer
-            inputs = layer.input
-            if isinstance(inputs, list):
-                # Retrieve value for each input tensor in the list
-                inp_vals = [tensor_values[id(t)] for t in inputs]
-            else:
-                inp_vals = tensor_values[id(inputs)]
-                
-            # Execute layer operation
-            if mode == "calibrate":
-                out_val = q_layer.calibrate(inp_vals)
-            elif mode == "quantize":
-                out_val = q_layer.quantized_infer(inp_vals)
-            elif mode == "integer":
-                out_val = q_layer.quantized_infer_integer(inp_vals)
-            elif mode == "float":
-                # Fallback to standard float forward
-                inputs_tf = [tf.convert_to_tensor(v, dtype=tf.float32) for v in inp_vals] if isinstance(inp_vals, list) else tf.convert_to_tensor(inp_vals, dtype=tf.float32)
-                outputs_tf = layer(inputs_tf)
-                out_val = outputs_tf.numpy()
-            else:
-                raise ValueError(f"Unknown graph mode: {mode}")
-                
-            # Store outputs
-            outputs = layer.output
-            if isinstance(outputs, list):
-                for j, out_t in enumerate(outputs):
-                    tensor_values[id(out_t)] = out_val[j]
-            else:
-                tensor_values[id(outputs)] = out_val
-                
-        # Return outputs matching model structure
-        if len(self.model.outputs) == 1:
-            out_val = tensor_values[id(self.model.outputs[0])]
-        else:
-            out_val = [tensor_values[id(out)] for out in self.model.outputs]
-            
-        if mode == "integer":
-            # Dequantize final integer outputs back to float for user/evaluation comparison
-            final_layer = self.model.layers[-1]
-            q_layer = self.quant_layers[final_layer.name]
-            if isinstance(out_val, list):
-                return [dequantize(val, q_layer.out_scale, q_layer.out_zp) for val in out_val]
-            else:
-                return dequantize(out_val, q_layer.out_scale, q_layer.out_zp)
-                
-        return out_val
+        """Executes the graph layer by layer.
 
+        Args:
+            x: input array (single-input models) or dict keyed by input name.
+            mode: ``"float"`` (reference), ``"calibrate"``, ``"quantize"``
+                (fake quantization) or ``"integer"`` (integer-only math,
+                outputs dequantized to float).
+        """
+        if mode not in MODES:
+            raise ValueError(f"Unknown graph mode: {mode}")
+        if mode == "float":
+            return float_ops.run_float(self.graph, x)
+        env, outputs = self._execute(x, mode)
+        return outputs
+
+    def _execute(self, x, mode, trace=None):
+        graph = self.graph
+        if mode != "calibrate" and not self.calibrated:
+            raise ValueError("Container is not calibrated; call calibrate().")
+        feeds = self._feeds(x)
+        env = {}
+        for name, value in feeds.items():
+            if mode == "calibrate":
+                lo, hi = float(value.min()), float(value.max())
+                cur = self._input_range.get(name)
+                self._input_range[name] = (
+                    (lo, hi)
+                    if cur is None
+                    else (min(cur[0], lo), max(cur[1], hi))
+                )
+                env[name] = value
+            else:
+                qp = self.qparams[name]
+                env[name] = (
+                    fake_quantize if mode == "quantize" else quantize
+                )(value, qp.scale, qp.zp, qp.qmin, qp.qmax)
+        for name in self._const_names:
+            env[name] = (
+                self._const_q[name]
+                if mode == "integer"
+                else graph.initializers[name]
+            )
+
+        last_use = {}
+        for idx, node in enumerate(graph.nodes):
+            for n in node.inputs:
+                last_use[n] = idx
+        keep = set(graph.outputs) if trace is None else None
+
+        for idx, node in enumerate(graph.nodes):
+            layer = self.quant_layers[node.name]
+            ins = [env[n] for n in layer.data_inputs]
+            if mode == "calibrate":
+                outs = layer.calibrate(ins)
+            elif mode == "quantize":
+                outs = layer.quantized_infer(ins)
+            else:
+                outs = layer.quantized_infer_integer(ins)
+            env.update(zip(node.outputs, outs))
+            if trace is not None:
+                trace(layer, outs)
+            else:  # free tensors that no later layer needs
+                for n in set(layer.data_inputs):
+                    if last_use.get(n) == idx and n not in keep:
+                        env.pop(n, None)
+
+        results = []
+        for name in graph.outputs:
+            value = env[name]
+            if mode == "integer":
+                qp = self.qparams[name]
+                value = dequantize(value, qp.scale, qp.zp)
+            results.append(value)
+        return env, (results[0] if len(results) == 1 else results)
+
+    # ---------------------------------------------------------- analysis ----
     def compare_layers(self, x, mode="quantize"):
+        """Per-layer error of the quantized pass against the float pass.
+
+        Returns:
+            ``{layer name: {"max_diff", "mean_diff", "layer_type"}}``; every
+            layer is compared on the (cumulative) outputs of the full float and
+            the full quantized run.
         """
-        Runs both float and quantized execution passes and returns a dictionary 
-        containing comparison metrics (Max Diff, Mean Diff) for each layer.
-        mode can be 'quantize' or 'integer'.
-        """
-        tensor_values_float = {}
-        tensor_values_quant = {}
-        
-        # Feed inputs
-        if not isinstance(x, dict):
-            input_tensor = self.model.inputs[0]
-            tensor_values_float[id(input_tensor)] = x
-            tensor_values_quant[id(input_tensor)] = x
-        else:
-            for k, v in x.items():
-                for inp in self.model.inputs:
-                    if inp.name == k:
-                        tensor_values_float[id(inp)] = v
-                        tensor_values_quant[id(inp)] = v
-                        break
-                        
+        if mode not in ("quantize", "integer"):
+            raise ValueError("mode must be 'quantize' or 'integer'")
+        float_env = float_ops.run_float(self.graph, x, keep_all=True)
         comparison = {}
-        
-        for layer in self.model.layers:
-            if isinstance(layer, keras.layers.InputLayer):
-                layer_output = layer.output
-                q_layer = self.quant_layers[layer.name]
+
+        def trace(layer, outs):
+            diffs = []
+            for name, q in zip(layer.node.outputs, outs):
                 if mode == "integer":
-                    tensor_values_quant[id(layer_output)] = q_layer.quantized_infer_integer(x)
-                else:
-                    tensor_values_quant[id(layer_output)] = q_layer.quantized_infer(x)
-                    
-                if id(layer_output) not in tensor_values_float:
-                    if not isinstance(x, dict):
-                        tensor_values_float[id(layer_output)] = x
-                continue
-                
-            q_layer = self.quant_layers[layer.name]
-            
-            # --- Float pass ---
-            inputs_f = layer.input
-            if isinstance(inputs_f, list):
-                inp_vals_f = [tensor_values_float[id(t)] for t in inputs_f]
-            else:
-                inp_vals_f = tensor_values_float[id(inputs_f)]
-                
-            inputs_tf = [tf.convert_to_tensor(v, dtype=tf.float32) for v in inp_vals_f] if isinstance(inp_vals_f, list) else tf.convert_to_tensor(inp_vals_f, dtype=tf.float32)
-            outputs_tf = layer(inputs_tf)
-            out_val_f = outputs_tf.numpy()
-            
-            outputs_f = layer.output
-            if isinstance(outputs_f, list):
-                for j, out_t in enumerate(outputs_f):
-                    tensor_values_float[id(out_t)] = out_val_f[j]
-            else:
-                tensor_values_float[id(outputs_f)] = out_val_f
-                
-            # --- Quantized pass ---
-            inputs_q = layer.input
-            if isinstance(inputs_q, list):
-                inp_vals_q = [tensor_values_quant[id(t)] for t in inputs_q]
-            else:
-                inp_vals_q = tensor_values_quant[id(inputs_q)]
-                
-            if mode == "integer":
-                out_val_q = q_layer.quantized_infer_integer(inp_vals_q)
-            else:
-                out_val_q = q_layer.quantized_infer(inp_vals_q)
-                
-            outputs_q = layer.output
-            if isinstance(outputs_q, list):
-                for j, out_t in enumerate(outputs_q):
-                    tensor_values_quant[id(out_t)] = out_val_q[j]
-            else:
-                tensor_values_quant[id(outputs_q)] = out_val_q
-                
-            # --- Compute metrics ---
-            if mode == "integer":
-                if isinstance(out_val_q, list):
-                    out_val_q_float = [dequantize(val, q_layer.out_scale, q_layer.out_zp) for val in out_val_q]
-                else:
-                    out_val_q_float = dequantize(out_val_q, q_layer.out_scale, q_layer.out_zp)
-            else:
-                out_val_q_float = out_val_q
-                
-            if isinstance(out_val_f, list):
-                max_diff = np.max([np.max(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q_float)])
-                mean_diff = np.mean([np.mean(np.abs(f - q)) for f, q in zip(out_val_f, out_val_q_float)])
-            else:
-                max_diff = np.max(np.abs(out_val_f - out_val_q_float))
-                mean_diff = np.mean(np.abs(out_val_f - out_val_q_float))
-                
+                    qp = self.qparams[name]
+                    q = dequantize(q, qp.scale, qp.zp)
+                diffs.append(np.abs(float_env[name] - q))
             comparison[layer.name] = {
-                "max_diff": max_diff,
-                "mean_diff": mean_diff,
-                "layer_type": type(layer).__name__
+                "max_diff": float(max(d.max() for d in diffs)),
+                "mean_diff": float(np.mean([d.mean() for d in diffs])),
+                "layer_type": layer.node.op_type,
             }
-            
+
+        self._execute(x, mode, trace=trace)
         return comparison
+
+    # ----------------------------------------------------- persistence ----
+    def save(self, path):
+        """Writes the quantization parameters (not the weights) as JSON.
+
+        Together with the original ONNX file this fully determines the
+        quantized model, see :meth:`load`.
+        """
+        payload = {
+            "quant_type": self.quant_type,
+            "per_channel": self.per_channel,
+            "qparams": {k: v.to_dict() for k, v in self.qparams.items()},
+        }
+        Path(path).write_text(json.dumps(payload, indent=2))
+
+    @classmethod
+    def load(cls, model, path):
+        """Rebuilds a calibrated container from ``model`` and a saved JSON."""
+        payload = json.loads(Path(path).read_text())
+        container = cls(model, payload["quant_type"], payload["per_channel"])
+        container.qparams = {
+            k: QParams.from_dict(v) for k, v in payload["qparams"].items()
+        }
+        missing = [
+            n
+            for n in container.graph.input_names + container._const_names
+            if n not in container.qparams
+        ]
+        if missing:
+            raise ValueError(f"saved parameters do not match model: {missing}")
+        container._const_q = {}
+        for name in container._const_names:
+            qp = container.qparams[name]
+            container._const_q[name] = quantize(
+                container.graph.initializers[name].astype(np.float32),
+                qp.scale,
+                qp.zp,
+                qp.qmin,
+                qp.qmax,
+            )
+        for layer in container.quant_layers.values():
+            layer.load_qparams(container)
+        container.calibrated = True
+        return container
