@@ -847,14 +847,55 @@ class _MultiInputLayer(BaseQuantLayer):
 
 
 class AddQuantize(_MultiInputLayer):
-    """``Add`` / ``Sub``: both operands are rescaled to the output scale."""
+    """``Add`` / ``Sub``: both operands are rescaled to the output scale.
+
+    ``add_impl="tflite"`` runs Google's left-shift Add bit-exactly
+    (:mod:`quantization.tflite_add`): the power-of-two int16 path when the
+    scales allow it, the general ``left_shift`` path otherwise. ``Sub`` always
+    uses the exact kernel.
+    """
+
+    add_impl = "exact"
 
     def prepare(self):
         self._mult = self._mults([qp.scale for qp in self.in_qp])
         self._sign = -1 if self.node.op_type == "Sub" else 1
+        self._tflite = None
+        if self.add_impl == "tflite" and self._sign == 1:
+            from quantization import tflite_add
+
+            a, b = self.in_qp
+            o = self.out_qp[0]
+            shifts = (
+                tflite_add.pot_shifts(a.scale, b.scale, o.scale)
+                if a.zp == b.zp == o.zp == 0 and o.qmax - o.qmin >= 2**15
+                else None
+            )
+            if shifts is not None:
+                self._tflite = ("pot", shifts)
+            else:
+                self._tflite = (
+                    "general",
+                    tflite_add.prepare(
+                        a.scale,
+                        b.scale,
+                        o.scale,
+                        a.zp,
+                        b.zp,
+                        o.zp,
+                        o.qmin,
+                        o.qmax,
+                    ),
+                )
 
     def quantized_infer_integer(self, inputs):
         self._check_ready()
+        if self._tflite is not None:
+            from quantization import tflite_add
+
+            kind, par = self._tflite
+            fn = tflite_add.add_pot if kind == "pot" else tflite_add.add
+            return [fn(inputs[0], inputs[1], par).astype(np.int32)]
         (ma, sa), (mb, sb) = self._mult
         a, b = self.in_qp
         o = self.out_qp[0]

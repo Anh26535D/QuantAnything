@@ -341,3 +341,11 @@ uv run jupyter notebook quantization_test.ipynb
 cmake -S quantization/kernels -B build && cmake --build build
 QA_LIB=$PWD/build/libqa_kernels.so uv run python -m pytest quantization/tests/
 ```
+
+## TFLite-compatible integer Add
+
+`quantization/tflite_add.py` is a bit-exact port of TensorFlow Lite's quantized
+`Add` (left shift 20 for int8, 15 for int16, double-rounding multipliers, and
+the power-of-two int16 path). Enable it with
+`QuantContainer(..., add_impl="tflite")`; tests compare against golden vectors
+produced by Google's own gemmlowp code.

@@ -53,6 +53,7 @@ class QuantContainer:
         residual=None,
         residual_bits=16,
         fuse_residual=True,
+        add_impl="exact",
     ):
         if residual not in (None, "accumulate", "lazy"):
             raise ValueError("residual must be None, 'accumulate' or 'lazy'")
@@ -68,6 +69,9 @@ class QuantContainer:
             self.quant_layers[node.name] = map_node_to_quant(
                 node, self.graph, quant_type, per_channel, nonlinear
             )
+        for layer in self.quant_layers.values():
+            if hasattr(layer, "add_impl"):
+                layer.add_impl = add_impl
         self.residual = residual
         self.residual_bits = residual_bits
         self.precision = dict(precision or {})
