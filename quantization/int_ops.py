@@ -29,6 +29,7 @@ MANT_BITS = 15  # reciprocal mantissa Q15
 RSQRT_IN_BITS = 14  # rsqrt mantissa Q14
 VAR_FRAC_BITS = 8  # variance fixed-point fraction
 CENTER_FRAC_BITS = 4  # fraction of the centred values in LayerNorm
+LN_INPUT_BITS = 18  # magnitude bits of the LayerNorm input that are kept
 
 
 @functools.lru_cache(maxsize=None)
@@ -107,6 +108,13 @@ def layer_norm(
     ``beta / out_scale`` per channel (see :func:`prepare_layer_norm`).
     """
     x = np.asarray(codes, dtype=np.int64)
+    # Wide inputs (e.g. a 24-bit residual stream): keep the top LN_INPUT_BITS
+    # bits (block-floating-point style) so the squares stay inside int64.
+    mag = int(np.abs(x).max()) if x.size else 0
+    drop = max(0, mag.bit_length() - LN_INPUT_BITS)
+    if drop:
+        x = (x + (1 << (drop - 1))) >> drop
+        in_scale = in_scale * (1 << drop)
     c = x.shape[-1]
     m_c, s_c = quantize_multiplier(1.0 / c)
     q = CENTER_FRAC_BITS

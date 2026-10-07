@@ -205,7 +205,10 @@ def _multi_head_attention(node, inputs, opset, **kw):
 @register("LinearLayer")
 def _linear_layer(node, inputs, opset, **kw):
     """``MatMul(x, W) + b``: one layer with the bias fused in."""
-    return (np.matmul(inputs[0], inputs[1]) + inputs[2]).astype(np.float32)
+    y = np.matmul(inputs[0], inputs[1]) + inputs[2]
+    if len(inputs) > 3 and inputs[3] is not None:  # fused residual add
+        y = y + inputs[3]
+    return y.astype(np.float32)
 
 
 @register("FusedElementwise")

@@ -934,6 +934,53 @@ def fold_mul_into_linear(graph):
     return len(removed)
 
 
+def fuse_residual_add(graph):
+    """``Add(LinearLayer(x, W, b), R)`` -> ``LinearLayer(x, W, b, R)``.
+
+    The residual input ``R`` joins the layer's accumulator, so the linear term
+    is never rounded to its own narrow grid before the addition ("delayed
+    add": the sum happens inside the producing GEMM's wide accumulator). Not
+    part of :func:`run_passes`; the container applies it for
+    ``residual="accumulate"``.
+    """
+    cons = _consumers(graph)
+    prod = {o: n for n in graph.nodes for o in n.outputs}
+    init = graph.initializers
+    fused, removed = {}, set()
+    for add in graph.nodes:
+        if add.op_type != "Add" or len(add.inputs) != 2:
+            continue
+        if any(i in init for i in add.inputs):
+            continue
+        for lin_t, other in (add.inputs, add.inputs[::-1]):
+            lin = prod.get(lin_t)
+            if (
+                lin is not None
+                and lin.op_type == "LinearLayer"
+                and len(lin.inputs) == 3
+                and id(lin) not in fused
+                and len(cons[lin_t]) == 1
+                and lin_t not in graph.outputs
+                and other != lin_t
+            ):
+                fused[id(lin)] = Node(
+                    lin.name,
+                    "LinearLayer",
+                    lin.inputs + [other],
+                    list(add.outputs),
+                    dict(lin.attrs),
+                )
+                removed.add(id(add))
+                break
+    if fused:
+        graph.nodes = [
+            fused.get(id(n), n) for n in graph.nodes if id(n) not in removed
+        ]
+        graph._index()
+        graph._toposort()
+    return len(fused)
+
+
 def run_passes(graph):
     """Applies every rewrite; returns ``{pass name: matches}``."""
     return {

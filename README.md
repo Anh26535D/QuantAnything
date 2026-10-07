@@ -244,6 +244,48 @@ Ablation: the PWL softmax and PWL LayerNorm alone cost almost nothing (cosine
 segments are visibly coarse. int8 still collapses on ViTs for the reason
 explained above (residual stream), independently of the PWL.
 
+### Residual streams: "delayed add" without a wide Add
+
+The residual stream of a ViT carries *massive activations* (abs-max ~570 vs
+~15 for the 99.9th percentile). On a narrow grid they erase every other
+channel; a wide `Add` fixes part of it but needs an elementwise 16-bit add.
+`QuantContainer(..., residual="accumulate", residual_bits=16)` removes the
+`Add` as a separate operation:
+
+* every chain of residual adds shares **one fixed grid** (`int{residual_bits}`),
+  so `R + term` only rescales the new term, the running sum is never rescaled
+  or re-rounded (a write-accumulate into an accumulator buffer),
+* `Add(LinearLayer(x, W, b), R)` is fused into the layer (`fuse_residual_add`):
+  the int32 accumulator of the GEMM goes **straight to the residual grid** and
+  is added to `R` in the epilogue, so the linear term is never rounded to its
+  own int8 grid (that rounding of the MLP output was the dominant remaining
+  error).
+
+`precision={"LayerNormalization": "int16", "Add": "int16", "<layer name>": ...}`
+overrides the output grid per op type or layer; `residual="lazy"` keeps the
+exact sum of the (int8) terms for comparison.
+
+Measured on ViT-Ti/16 (strict full-integer, 4-segment PWL, int8 weights and
+activations unless stated; logit cosine vs float):
+
+| Configuration | cosine |
+| :--- | :--- |
+| A. everything int8 | 0.157 |
+| B. separate `Add` with its own int16 grid | 0.661 |
+| C. shared int16 stream grid, separate `Add` | 0.613 |
+| **D. delayed add fused into the GEMM accumulator, int16 stream** | **0.894** |
+| E. same, int14 stream grid | 0.880 |
+| F. same, int12 stream grid | 0.841 |
+| G. D + every other activation int16 | 0.989 |
+
+After D the remaining error is spread over the other int8 activations (qkv,
+fc1, GELU, attention, LayerNorm outputs), no single one dominates; that is the
+usual per-channel-outlier problem of ViT activations, not a residual problem.
+The hardware requirement of D is a GEMM epilogue that can read a 16-bit
+residual tensor and add it inside the 32-bit accumulator domain; the
+LayerNorm that consumes the stream only needs reductions (its integer
+implementation keeps the top 18 magnitude bits of a wide input).
+
 ---
 
 ## 4. Timeline for Improvements

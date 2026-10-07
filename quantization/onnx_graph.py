@@ -443,13 +443,19 @@ class OnnxGraph:
                 else:
                     nodes.append(("MHA", node))
             elif op == "LinearLayer":
+                # a 4th input is a fused residual: the layer is written
+                # without it and followed by a standard ``Add``
+                has_res = len(node.inputs) > 3 and node.inputs[3]
+                lin_out = (
+                    node.outputs[0] + "_linear" if has_res else node.outputs[0]
+                )
                 if use_functions:
                     uses_linear = True
                     nodes.append(
                         helper.make_node(
                             "LinearLayer",
-                            node.inputs,
-                            node.outputs,
+                            node.inputs[:3],
+                            [lin_out],
                             name=node.name,
                             domain=LINEAR_DOMAIN,
                         )
@@ -460,8 +466,15 @@ class OnnxGraph:
                     emit(
                         "Add",
                         [mid, node.inputs[2]],
-                        node.outputs,
+                        [lin_out],
                         node.name + "_bias",
+                    )
+                if has_res:
+                    emit(
+                        "Add",
+                        [lin_out, node.inputs[3]],
+                        node.outputs,
+                        node.name + "_residual",
                     )
             elif op == "Silu":
                 sig = node.outputs[0] + "_sigmoid"

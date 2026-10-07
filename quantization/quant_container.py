@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from quantization import float_ops
+from quantization import float_ops, graph_passes
 from quantization.onnx_graph import OnnxGraph
 from quantization.quant_layers import BaseQuantLayer, map_node_to_quant
 from quantization.utils import (
@@ -49,8 +49,17 @@ class QuantContainer:
         per_channel=True,
         nonlinear="pwl",
         strict=False,
+        precision=None,
+        residual=None,
+        residual_bits=16,
+        fuse_residual=True,
     ):
+        if residual not in (None, "accumulate", "lazy"):
+            raise ValueError("residual must be None, 'accumulate' or 'lazy'")
         self.graph = OnnxGraph.from_model(model)
+        self.fused_residuals = 0
+        if residual == "accumulate" and fuse_residual:
+            self.fused_residuals = graph_passes.fuse_residual_add(self.graph)
         self.quant_type = quant_type
         self.per_channel = per_channel
         self.nonlinear = nonlinear
@@ -59,6 +68,15 @@ class QuantContainer:
             self.quant_layers[node.name] = map_node_to_quant(
                 node, self.graph, quant_type, per_channel, nonlinear
             )
+        self.residual = residual
+        self.residual_bits = residual_bits
+        self.precision = dict(precision or {})
+        for layer in self.quant_layers.values():  # mixed precision
+            override = self.precision.get(layer.name) or self.precision.get(
+                layer.node.op_type
+            )
+            if override:
+                layer.out_quant_type = override
         fallbacks = self.float_fallbacks()
         if strict and fallbacks:
             raise NotIntegerError(
@@ -81,6 +99,91 @@ class QuantContainer:
                 if self.graph.is_constant(n) and n not in names:
                     names.append(n)
         return names
+
+    def residual_groups(self):
+        """Chains of ``Add`` layers that carry a residual stream.
+
+        Two ``Add`` nodes belong to the same stream when the output of one is
+        an input of the other (e.g. every skip connection of a transformer).
+        Streams with a single ``Add`` are ignored.
+        """
+        adds = [
+            l
+            for l in self.layers
+            if (
+                l.node.op_type == "Add"
+                and type(l).__name__ == "AddQuantize"
+                and any(not self.graph.is_constant(i) for i in l.node.inputs)
+            )
+            or (
+                type(l).__name__ == "GemmQuantize"
+                and getattr(l, "has_residual", False)
+            )
+        ]
+        parent = {l.name: l.name for l in adds}
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        by_output = {l.node.outputs[0]: l for l in adds}
+        for l in adds:
+            for tensor in l.node.inputs:
+                if tensor in by_output:
+                    parent[find(l.name)] = find(by_output[tensor].name)
+        groups = {}
+        for l in adds:
+            groups.setdefault(find(l.name), []).append(l)
+        return [g for g in groups.values() if len(g) >= 2]
+
+    def _term_scale(self, tensor):
+        """Quantization step of an unmerged residual term (calibrated)."""
+        producer = self.graph.producers.get(tensor)
+        if producer is not None:
+            layer = self.quant_layers[producer.name]
+            idx = producer.outputs.index(tensor)
+            lo, hi = layer.out_min[idx], layer.out_max[idx]
+        elif tensor in self.graph.initializers:
+            value = self.graph.initializers[tensor]
+            lo, hi = float(value.min()), float(value.max())
+        else:
+            lo, hi = self._input_range[tensor]
+        return calculate_scale_zp(lo, hi, self.quant_type)[0]
+
+    def _assign_residual_grids(self):
+        """Gives every residual stream one shared output grid.
+
+        ``accumulate``: a fixed ``int{residual_bits}`` grid covering the whole
+        stream, so ``R + term`` only rescales the *new term* (the running sum
+        is never rescaled or re-rounded, like a write-accumulate into an
+        accumulator buffer). ``lazy``: the stream is kept at a grid 16x finer
+        than the finest term, i.e. the exact sum of the (int8) terms, which a
+        "delayed add" hardware would evaluate inside the consumer's
+        accumulator instead of storing it.
+        """
+        self._stream_consts = set()
+        if self.residual is None:
+            return
+        for group in self.residual_groups():
+            lo = min(l.out_min[0] for l in group)
+            hi = max(l.out_max[0] for l in group)
+            names = {l.node.outputs[0] for l in group}
+            terms = [t for l in group for t in l.node.inputs if t not in names]
+            if self.residual == "accumulate":
+                qp = QParams(
+                    *calculate_scale_zp(lo, hi, f"int{self.residual_bits}")
+                )
+                self._stream_consts.update(
+                    t for t in terms if self.graph.is_constant(t)
+                )
+            else:
+                fine = min(self._term_scale(t) for t in terms) / 16.0
+                fine = max(fine, max(abs(lo), abs(hi)) / 2**30)
+                qp = QParams(fine, 0, -(2**31) + 1, 2**31 - 1)
+            for l in group:
+                l.forced_out_qp = qp
 
     def float_fallbacks(self):
         """Layers that still run as dequantize -> float -> quantize."""
@@ -135,10 +238,17 @@ class QuantContainer:
                 *calculate_scale_zp(lo, hi, self.quant_type)
             )
         self._const_q = {}
+        self._assign_residual_grids()
         for name in self._const_names:
             value = self.graph.initializers[name].astype(np.float32)
             qp = QParams(
-                *calculate_scale_zp(value.min(), value.max(), self.quant_type)
+                *calculate_scale_zp(
+                    value.min(),
+                    value.max(),
+                    f"int{self.residual_bits}"
+                    if name in self._stream_consts
+                    else self.quant_type,
+                )
             )
             self.qparams[name] = qp
             self.tensor_range[name] = (float(value.min()), float(value.max()))

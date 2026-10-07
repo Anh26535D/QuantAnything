@@ -36,6 +36,11 @@ from quantization.utils import (
 MAX_LUT_BITS = 16
 
 
+def qp_bits(qp):
+    """Bit-width of a quantization grid."""
+    return int(np.ceil(np.log2(qp.qmax - qp.qmin + 1)))
+
+
 def _min_max(x, cur_min, cur_max):
     lo, hi = float(np.min(x)), float(np.max(x))
     if cur_min is None:
@@ -78,6 +83,10 @@ class BaseQuantLayer:
     #: ``"pwl"``: non-linear functions as <= 4-segment piecewise-linear integer
     #: functions (full integer pipeline); ``"lut"``: tabulated / float.
     nonlinear = "pwl"
+    #: quantization type of the *output* grid (default: ``quant_type``)
+    out_quant_type = None
+    #: output grid imposed by the container (e.g. shared residual stream)
+    forced_out_qp = None
 
     def __init__(self, node, graph, quant_type="int8", per_channel=True):
         self.node = node
@@ -143,6 +152,8 @@ class BaseQuantLayer:
 
     # -------------------------------------------------------- finalize ----
     def _default_out_qparams(self):
+        if self.forced_out_qp is not None:
+            return [self.forced_out_qp] * len(self.node.outputs)
         qps = []
         for i, name in enumerate(self.node.outputs):
             if self.out_min[i] is None:
@@ -153,7 +164,9 @@ class BaseQuantLayer:
             qps.append(
                 QParams(
                     *calculate_scale_zp(
-                        self.out_min[i], self.out_max[i], self.quant_type
+                        self.out_min[i],
+                        self.out_max[i],
+                        self.out_quant_type or self.quant_type,
                     )
                 )
             )
@@ -268,7 +281,8 @@ class _WeightedLayer(BaseQuantLayer):
             self.w_scale, self.w_zp = float(scale_c[0]), int(zp_c[0])
 
         self._reduction = int(np.prod(w.shape) // w.shape[self.weight_axis])
-        self.wide = native.accumulator_is_wide(self.num_bits, self._reduction)
+        bits = max(self.num_bits, qp_bits(self.in_qp[0]))
+        self.wide = native.accumulator_is_wide(bits, self._reduction)
         self.w_q = quantize(
             w,
             scale_c.reshape(bshape),
@@ -362,6 +376,28 @@ class GemmQuantize(_WeightedLayer):
 
     weight_axis = 1  # weights are laid out [K, N]
 
+    def _select_data_inputs(self):
+        inputs = self.node.inputs
+        if (
+            self.node.op_type == "LinearLayer"
+            and len(inputs) > 3
+            and inputs[3]
+        ):
+            return [inputs[0], inputs[3]]  # + fused residual input
+        return [inputs[0]]
+
+    @property
+    def has_residual(self):
+        """True when an ``Add`` with a residual stream is fused in."""
+        return len(self.data_inputs) > 1
+
+    def prepare(self):
+        super().prepare()
+        if self.has_residual:
+            r, o = self.in_qp[1], self.out_qp[0]
+            self._same_grid = (r.scale, r.zp) == (o.scale, o.zp)
+            self._res_mult = quantize_multiplier(r.scale / o.scale)
+
     def _weights(self):
         node = self.node
         b = self.graph.initializers[node.inputs[1]].astype(np.float32)
@@ -395,7 +431,10 @@ class GemmQuantize(_WeightedLayer):
         y = native.gemm_f32(self._flatten(x), self.fake_w)
         if self.fake_bias is not None:
             y = y + self.fake_bias
-        return self._fq_outputs([y.reshape(self._out_shape(x))])
+        y = y.reshape(self._out_shape(x))
+        if self.has_residual:
+            y = y + self._fq_inputs(inputs)[1]
+        return self._fq_outputs([y])
 
     def quantized_infer_integer(self, inputs):
         self._check_ready()
@@ -403,19 +442,46 @@ class GemmQuantize(_WeightedLayer):
         x2 = self._flatten(x) - self.in_zp
         acc = native.gemm_int(x2, self.w_centered, self.wide)
         m, n = acc.shape
-        out = native.requantize(
+        if not self.has_residual:
+            out = native.requantize(
+                acc,
+                m,
+                n,
+                1,
+                self.q_mult,
+                self.shift,
+                self.out_zp,
+                self.out_qmin,
+                self.out_qmax,
+                pre_bias=self.bias_int,
+            )
+            return [out.reshape(self._out_shape(x))]
+        # Delayed add: the accumulator goes straight to the residual grid
+        # (no intermediate narrow quantization of the linear term) ...
+        term = native.requantize(
             acc,
             m,
             n,
             1,
             self.q_mult,
             self.shift,
-            self.out_zp,
-            self.out_qmin,
-            self.out_qmax,
+            0,
+            -(2**31) + 1,
+            2**31 - 1,
             pre_bias=self.bias_int,
-        )
-        return [out.reshape(self._out_shape(x))]
+        ).reshape(self._out_shape(x))
+        # ... and is added to the running residual, which keeps its own grid
+        # whenever the stream shares one (``_same_grid``: no multiplier).
+        res = np.asarray(inputs[1])
+        r_zp = self.in_qp[1].zp
+        if self._same_grid:
+            carried = res.astype(np.int64) - r_zp
+        else:
+            carried = native.rescale(
+                res, r_zp, *self._res_mult, 0, -(2**31) + 1, 2**31 - 1
+            ).astype(np.int64)
+        out = term.astype(np.int64) + carried + self.out_zp
+        return [np.clip(out, self.out_qmin, self.out_qmax).astype(np.int32)]
 
 
 class MultiHeadAttentionQuantize(BaseQuantLayer):
@@ -480,8 +546,9 @@ class MultiHeadAttentionQuantize(BaseQuantLayer):
         b, t = x.shape[:2]
         q, k, v = self._split_heads((x - qp.zp).astype(np.int32))
         heads, hd = q.shape[1], q.shape[3]
-        wide_qk = native.accumulator_is_wide(self.num_bits, hd)
-        wide_pv = native.accumulator_is_wide(self.num_bits, t)
+        bits = max(self.num_bits, qp_bits(qp))
+        wide_qk = native.accumulator_is_wide(bits, hd)
+        wide_pv = native.accumulator_is_wide(max(self.num_bits, bits), t)
         acc_dtype = np.int64 if wide_pv else np.int32
         o_acc = np.empty((b, heads, t, hd), dtype=acc_dtype)
         for i in range(b):
