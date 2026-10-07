@@ -236,3 +236,38 @@ def test_exported_model_expands_the_fused_residual():
 def test_invalid_residual_mode_is_rejected():
     with pytest.raises(ValueError, match="residual"):
         QC(_stream_model(), residual="sometimes")
+
+
+def test_every_vit_add_is_a_plain_integer_addition():
+    """Same scale and zero point on both operands: no multiplier, no shift."""
+    model = build_vit(batch=2, depth=3, ln_style="op", gelu_style="op")
+    rng = np.random.default_rng(0)
+    cal = [rng.standard_normal((2, 3, 32, 32)).astype(np.float32)]
+    c = QuantContainer(model, "int8", strict=True, residual="accumulate")
+    c.calibrate(cal)
+    report = c.residual_report()
+    assert len(report) == 1 + 2 * 3
+    assert not any(needs for _, needs in report)
+    # the embedding add (patch tokens + cls + position embedding) included
+    (group,) = c.residual_groups()
+    embed = next(l for l in group if type(l).__name__ == "AddQuantize")
+    grid = embed.out_qp[0]
+    assert all(
+        (qp.scale, qp.zp) == (grid.scale, grid.zp) for qp in embed.in_qp
+    )
+    assert embed._mult[0] == embed._mult[1] == (2**30, -1)  # exactly 1.0
+    # and the integer result still tracks the float model
+    out = c.run_graph(cal[0], "integer")
+    ref = c.run_graph(cal[0], "float")
+    assert np.abs(out - ref).max() < 0.3
+
+
+def test_graph_inputs_cannot_be_aligned_and_are_reported():
+    model = _stream_model()
+    c = QuantContainer(model, "int8", residual="accumulate")
+    c.calibrate([_data(1), _data(2)])
+    report = dict(c.residual_report())
+    first = next(iter(report))
+    assert report[first] is True and not any(
+        v for k, v in report.items() if k != first
+    )

@@ -261,6 +261,13 @@ channel; a wide `Add` fixes part of it but needs an elementwise 16-bit add.
   own int8 grid (that rounding of the MLP output was the dominant remaining
   error).
 
+With ``residual="accumulate"`` the producers of the stream roots (patch
+embedding, cls token, position embedding) are put on the same grid too, so
+**no add needs a rescale**: both operands have the same scale and zero point and
+the add is a plain (saturating) integer addition, without dequantization,
+multiplier or left shift. `container.residual_report()` lists the adds that
+would still need one (only a stream rooted directly at a graph input does).
+
 `precision={"LayerNormalization": "int16", "Add": "int16", "<layer name>": ...}`
 overrides the output grid per op type or layer; `residual="lazy"` keeps the
 exact sum of the (int8) terms for comparison.

@@ -152,38 +152,107 @@ class QuantContainer:
             lo, hi = self._input_range[tensor]
         return calculate_scale_zp(lo, hi, self.quant_type)[0]
 
+    def _stream_operands(self, layer):
+        """Tensors a residual-stream layer adds (the stream-side inputs)."""
+        if type(layer).__name__ == "AddQuantize":
+            return list(layer.data_inputs)
+        return [layer.data_inputs[1]]  # fused: x is not a stream input
+
+    def _align_roots(self, tensor, qp, forced, consts):
+        """Puts the producer chain of a stream *root* on the stream grid.
+
+        Scale-preserving layers are looked through, a ``Concat`` is forced
+        together with its inputs, constants are quantized on the stream grid;
+        any other producer simply gets the grid as its output grid.
+        """
+        if self.graph.is_constant(tensor):
+            consts.add(tensor)
+            return
+        node = self.graph.producers.get(tensor)
+        if node is None:  # graph input: keeps its grid
+            return
+        layer = self.quant_layers[node.name]
+        kind = type(layer).__name__
+        if kind == "ShapingQuantize":
+            self._align_roots(layer.data_inputs[0], qp, forced, consts)
+        elif kind == "ConcatQuantize":
+            forced.append(layer)
+            for t in layer.data_inputs:
+                self._align_roots(t, qp, forced, consts)
+        else:
+            forced.append(layer)
+
     def _assign_residual_grids(self):
         """Gives every residual stream one shared output grid.
 
         ``accumulate``: a fixed ``int{residual_bits}`` grid covering the whole
-        stream, so ``R + term`` only rescales the *new term* (the running sum
-        is never rescaled or re-rounded, like a write-accumulate into an
-        accumulator buffer). ``lazy``: the stream is kept at a grid 16x finer
-        than the finest term, i.e. the exact sum of the (int8) terms, which a
-        "delayed add" hardware would evaluate inside the consumer's
-        accumulator instead of storing it.
+        stream. Every operand of every add is put on that grid (the producers
+        of the stream roots too, e.g. the patch embedding and the position
+        embedding), so *no add needs a rescale*: it is a plain integer
+        addition of two numbers on the same grid, no dequantization and no
+        left shift. ``lazy``: the stream is kept at a grid 16x finer than the
+        finest term, i.e. the exact sum of the (int8) terms.
         """
-        self._stream_consts = set()
+        self._stream_consts = {}
         if self.residual is None:
             return
         for group in self.residual_groups():
             lo = min(l.out_min[0] for l in group)
             hi = max(l.out_max[0] for l in group)
             names = {l.node.outputs[0] for l in group}
-            terms = [t for l in group for t in l.node.inputs if t not in names]
+            roots = [
+                t
+                for l in group
+                for t in self._stream_operands(l)
+                if t not in names
+            ]
             if self.residual == "accumulate":
                 qp = QParams(
                     *calculate_scale_zp(lo, hi, f"int{self.residual_bits}")
                 )
-                self._stream_consts.update(
-                    t for t in terms if self.graph.is_constant(t)
+                forced, consts = [], set()
+                for t in roots:
+                    self._align_roots(t, qp, forced, consts)
+                # the grid must also cover the roots' own range
+                for layer in forced:
+                    lo = min(
+                        lo, min(m for m in layer.out_min if m is not None)
+                    )
+                    hi = max(
+                        hi, max(m for m in layer.out_max if m is not None)
+                    )
+                qp = QParams(
+                    *calculate_scale_zp(lo, hi, f"int{self.residual_bits}")
                 )
+                for layer in forced:
+                    layer.forced_out_qp = qp
+                self._stream_consts.update({t: qp for t in consts})
             else:
-                fine = min(self._term_scale(t) for t in terms) / 16.0
+                fine = min(self._term_scale(t) for t in roots) / 16.0
                 fine = max(fine, max(abs(lo), abs(hi)) / 2**30)
                 qp = QParams(fine, 0, -(2**31) + 1, 2**31 - 1)
             for l in group:
                 l.forced_out_qp = qp
+
+    def residual_report(self):
+        """Per residual add: does it still need a rescale of an operand?
+
+        Returns ``[(layer name, needs_rescale)]``; with
+        ``residual="accumulate"`` every entry is ``False`` once calibrated:
+        the add is then a plain integer addition (same scale, same zero
+        point) - no dequantization, no multiplier, no left shift.
+        """
+        out = []
+        for group in self.residual_groups():
+            for l in group:
+                o = l.out_qp[0]
+                same = [
+                    (self.qparams[t].scale, self.qparams[t].zp)
+                    == (o.scale, o.zp)
+                    for t in self._stream_operands(l)
+                ]
+                out.append((l.name, not all(same)))
+        return out
 
     def float_fallbacks(self):
         """Layers that still run as dequantize -> float -> quantize."""
@@ -241,15 +310,14 @@ class QuantContainer:
         self._assign_residual_grids()
         for name in self._const_names:
             value = self.graph.initializers[name].astype(np.float32)
-            qp = QParams(
-                *calculate_scale_zp(
-                    value.min(),
-                    value.max(),
-                    f"int{self.residual_bits}"
-                    if name in self._stream_consts
-                    else self.quant_type,
+            if name in self._stream_consts:  # constant on the stream grid
+                qp = self._stream_consts[name]
+            else:
+                qp = QParams(
+                    *calculate_scale_zp(
+                        value.min(), value.max(), self.quant_type
+                    )
                 )
-            )
             self.qparams[name] = qp
             self.tensor_range[name] = (float(value.min()), float(value.max()))
             self._const_q[name] = quantize(
